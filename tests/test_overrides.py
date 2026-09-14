@@ -125,6 +125,51 @@ def test_rewrite_swaps_flag_and_image_and_creates_dests(tmp_path):
         assert (sandbox / dst).is_dir(), f"{dst} not pre-created"
 
 
+def test_rewrite_binds_dev_and_resolver(tmp_path):
+    """A plain --writable dir loses tmpfs /dev + the host resolver; the rewriter
+    must bind them back so /dev/null exists and in-sandbox pip/uv can resolve DNS."""
+    sandbox = tmp_path / "sbx"
+    sandbox.mkdir()
+    sif = str(tmp_path / "img.sif")
+    SingularityWritableEnvironment._WRITABLE_REGISTRY[sif] = sandbox
+    try:
+        out = _rewrite_singularity_argv(_exec_argv(sif))
+    finally:
+        SingularityWritableEnvironment._WRITABLE_REGISTRY.pop(sif, None)
+
+    # Each host path that exists is bound exactly once via --bind <path>.
+    for hostpath in ("/dev", "/etc/resolv.conf", "/etc/hosts"):
+        if not Path(hostpath).exists():
+            continue
+        bound = [
+            out[i + 1] for i in range(len(out) - 1)
+            if out[i] in ("-B", "--bind") and str(out[i + 1]).split(":", 1)[0] == hostpath
+        ]
+        assert bound == [hostpath], f"{hostpath} should be bound exactly once, got {bound}"
+
+
+def test_rewrite_dev_bind_is_idempotent(tmp_path):
+    """Re-running the rewrite (or a host argv that already binds /dev) must not
+    add a duplicate bind."""
+    sandbox = tmp_path / "sbx"
+    sandbox.mkdir()
+    sif = str(tmp_path / "img.sif")
+    SingularityWritableEnvironment._WRITABLE_REGISTRY[sif] = sandbox
+    try:
+        once = _rewrite_singularity_argv(_exec_argv(sif))
+        # feed it back through unchanged-image path by re-registering the sandbox as
+        # its own image key is not needed; just assert a second pass over an argv that
+        # already binds /dev adds nothing new.
+        argv2 = ["singularity", "exec", "--bind", "/dev", "--writable-tmpfs",
+                 "-B", "/tmp/s:/staging", "--pwd", "/testbed", sif, "bash"]
+        out2 = _rewrite_singularity_argv(argv2)
+    finally:
+        SingularityWritableEnvironment._WRITABLE_REGISTRY.pop(sif, None)
+    if Path("/dev").exists():
+        assert sum(1 for i in range(len(out2) - 1)
+                   if out2[i] in ("-B", "--bind") and out2[i + 1] == "/dev") == 1
+
+
 def test_rewrite_ignores_unregistered_sif():
     argv = _exec_argv("/tmp/not-registered.sif")
     assert _rewrite_singularity_argv(argv) is argv  # unchanged, same object

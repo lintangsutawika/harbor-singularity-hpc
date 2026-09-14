@@ -10,6 +10,10 @@ previously lived as source patches against harbor:
   and run ``--fakeroot --writable <dir>`` instead of ``--writable-tmpfs <sif>``,
   for nodes whose ``/etc/fuse.conf`` lacks ``user_allow_other`` (there both
   ``--writable-tmpfs`` and ``--overlay`` silently degrade to a read-only rootfs).
+* **Host ``/dev`` + resolver rebind** -- a plain ``--writable`` dir has no tmpfs
+  ``/dev`` and an empty ``/etc/resolv.conf``/``/etc/hosts``; the rewriter binds the
+  host copies back in so ``/dev/null`` exists (bootstrap/apt/server) and in-sandbox
+  ``pip``/``uv`` can resolve DNS. Idempotent and skipped for already-bound paths.
 * **Node-local, resume-safe image cache** -- default to ``$PBS_LOCALDIR`` /
   ``$SLURM_TMPDIR`` resolved live, so a cache path is never baked stale into a
   chunked-resume job config.
@@ -124,6 +128,23 @@ def _rewrite_singularity_argv(argv: list) -> list:
     new = list(argv)
     new[new.index("--writable-tmpfs")] = "--writable"
     new[image_index] = str(sandbox)
+
+    # A plain ``--writable`` sandbox dir (unlike ``--writable-tmpfs``) has no tmpfs
+    # ``/dev`` and carries the image's own (empty) ``/etc/resolv.conf`` +
+    # ``/etc/hosts``. Under ``--containall`` that means no ``/dev/null`` -- which
+    # breaks bootstrap redirects, apt, and the in-container server -- and DNS
+    # failures ("Temporary failure in name resolution"), so in-sandbox ``pip``/``uv``
+    # cannot reach PyPI. The network namespace is shared (no ``--net``), so binding
+    # the host copies back in restores both. Idempotent: skip a path already bound
+    # (harbor's argv, or a repeat call) or absent on the host.
+    for hostpath in ("/dev", "/etc/resolv.conf", "/etc/hosts"):
+        already = any(
+            str(new[i]) in ("-B", "--bind") and i + 1 < len(new)
+            and str(new[i + 1]).split(":", 1)[0] == hostpath
+            for i in range(len(new))
+        )
+        if not already and os.path.exists(hostpath):
+            new[2:2] = ["--bind", hostpath]
     return new
 
 
@@ -155,7 +176,7 @@ class SingularityWritableEnvironment(SingularityEnvironment):
     invocation."""
 
     # Package version marker. Bump when the override behaviour changes.
-    _HB_HPC_PATCHSET = "1"
+    _HB_HPC_PATCHSET = "2"
 
     # Process-wide throttle on concurrent ``singularity pull``s. Many at once race
     # the shared OCI blob cache and burst Docker Hub's rate limit. Agent
