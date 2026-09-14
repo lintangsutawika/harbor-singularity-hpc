@@ -42,6 +42,8 @@ from __future__ import annotations
 import asyncio
 import os
 import shutil
+import signal
+import subprocess
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -147,6 +149,40 @@ class _TimeoutFloorClient:
     async def aclose(self) -> Any:
         return await self._inner.aclose()
 
+
+def _descendant_pids(root_pid: int) -> list[int]:
+    """Return all descendants of root_pid, deepest descendants first."""
+    try:
+        result = subprocess.run(
+            ["ps", "-eo", "pid=,ppid="],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except Exception:
+        return []
+
+    children: dict[int, list[int]] = {}
+
+    for line in result.stdout.splitlines():
+        try:
+            pid_s, ppid_s = line.split()
+            pid = int(pid_s)
+            ppid = int(ppid_s)
+        except (ValueError, TypeError):
+            continue
+
+        children.setdefault(ppid, []).append(pid)
+
+    descendants: list[int] = []
+
+    def walk(pid: int) -> None:
+        for child in children.get(pid, []):
+            walk(child)
+            descendants.append(child)
+
+    walk(root_pid)
+    return descendants
 
 class SingularityWritableEnvironment(SingularityEnvironment):
     """``SingularityEnvironment`` that yields a writable rootfs on FUSE-restricted
@@ -333,9 +369,28 @@ class SingularityWritableEnvironment(SingularityEnvironment):
             self._http_client = _TimeoutFloorClient(self._http_client, self._http_timeout_floor)
 
     async def stop(self, delete: bool) -> None:
+        # Harbor's stock stop() terminates the outer Singularity process before
+        # trying to kill its children. On this HPC setup, surviving Apptainer
+        # descendants can be re-parented to PID 1 before Harbor's pkill runs.
+        # Remember the process tree while it still belongs to this environment.
+        descendant_pids: list[int] = []
+
+        if self._server_process and self._server_process.returncode is None:
+            descendant_pids = _descendant_pids(self._server_process.pid)
+
         try:
             await super().stop(delete)
         finally:
+            # Reap only processes that belonged to this environment when
+            # teardown began.
+            for pid in descendant_pids:
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                except PermissionError:
+                    pass
+
             if self._sandbox_path is not None:
                 if self._sif_path is not None:
                     type(self)._WRITABLE_REGISTRY.pop(str(self._sif_path), None)
