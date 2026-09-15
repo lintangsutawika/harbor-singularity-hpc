@@ -14,6 +14,9 @@ previously lived as source patches against harbor:
   ``/dev`` and an empty ``/etc/resolv.conf``/``/etc/hosts``; the rewriter binds the
   host copies back in so ``/dev/null`` exists (bootstrap/apt/server) and in-sandbox
   ``pip``/``uv`` can resolve DNS. Idempotent and skipped for already-bound paths.
+* **Tag+digest ref normalization** -- ``singularity pull`` rejects a Docker ref carrying
+  both a tag and a digest ("...currently not supported"); strip the tag and keep the digest
+  so harbor's pinned task images (``repo:tag@sha256:...``) pull.
 * **Node-local, resume-safe image cache** -- default to ``$PBS_LOCALDIR`` /
   ``$SLURM_TMPDIR`` resolved live, so a cache path is never baked stale into a
   chunked-resume job config.
@@ -150,6 +153,24 @@ def _rewrite_singularity_argv(argv: list) -> list:
     return new
 
 
+def _singularity_safe_ref(ref: str) -> str:
+    """Make a Docker image reference acceptable to ``singularity pull``.
+
+    harbor hands the task image as ``repo:tag@sha256:<digest>`` (both a tag AND a digest).
+    Docker accepts that, but apptainer/singularity rejects it -- "Docker references with
+    both a tag and digest are currently not supported". When both are present, drop the tag
+    and keep the digest: the digest is the exact content pin, so the tag is redundant. Refs
+    with only a tag, or only a digest, pass through unchanged. A registry ``host:port`` in the
+    name is preserved (only the tag in the final path component is stripped)."""
+    if not ref or "@" not in ref:
+        return ref
+    name_tag, _, digest = ref.partition("@")
+    last = name_tag.rsplit("/", 1)[-1]  # final path component may carry "repo:tag"
+    if ":" in last:                     # strip the tag, keep any registry host:port prefix
+        name_tag = name_tag[: len(name_tag) - len(last)] + last.rsplit(":", 1)[0]
+    return f"{name_tag}@{digest}"
+
+
 class _TimeoutFloorClient:
     """Transparent proxy over harbor's httpx exec client that raises a request
     whose timeout is exactly harbor's default (i.e. the no-``timeout_sec`` exec
@@ -212,7 +233,7 @@ class SingularityWritableEnvironment(SingularityEnvironment):
     invocation."""
 
     # Package version marker. Bump when the override behaviour changes.
-    _HB_HPC_PATCHSET = "2"
+    _HB_HPC_PATCHSET = "3"
 
     # Process-wide throttle on concurrent ``singularity pull``s. Many at once race
     # the shared OCI blob cache and burst Docker Hub's rate limit. Agent
@@ -352,6 +373,8 @@ class SingularityWritableEnvironment(SingularityEnvironment):
         """Wrap harbor's converter with a process-wide pull semaphore and bounded
         retries. Each retry re-runs the base method, which returns immediately if
         the image is already cached, so a mid-run success costs nothing extra."""
+        # singularity pull rejects a tag+digest ref; normalize to digest-only.
+        docker_image = _singularity_safe_ref(docker_image)
         async with type(self)._PULL_SEMAPHORE:
             last_error: Exception | None = None
             for attempt in range(_MAX_PULL_ATTEMPTS):
