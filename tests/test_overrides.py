@@ -23,7 +23,25 @@ from harbor_singularity_hpc.environment import (
     _TimeoutFloorClient,
     _HARBOR_DEFAULT_HTTP_TIMEOUT,
     _rewrite_singularity_argv,
+    _singularity_safe_ref,
 )
+
+
+@pytest.mark.parametrize("ref,expected", [
+    # tag + digest -> drop the tag, keep the digest
+    ("harborframework/terminal-bench:layout-x-9caa9d66@sha256:c08989",
+     "harborframework/terminal-bench@sha256:c08989"),
+    # digest only -> unchanged
+    ("repo/img@sha256:abc", "repo/img@sha256:abc"),
+    # tag only -> unchanged
+    ("repo/img:1.2.3", "repo/img:1.2.3"),
+    # bare name -> unchanged
+    ("ubuntu", "ubuntu"),
+    # registry host:port preserved, only the trailing tag stripped
+    ("reg.io:5000/repo/img:tag@sha256:def", "reg.io:5000/repo/img@sha256:def"),
+])
+def test_singularity_safe_ref(ref, expected):
+    assert _singularity_safe_ref(ref) == expected
 
 
 # --------------------------------------------------------------------------- #
