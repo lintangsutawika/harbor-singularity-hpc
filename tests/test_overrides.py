@@ -24,6 +24,7 @@ from harbor_singularity_hpc.environment import (
     _HARBOR_DEFAULT_HTTP_TIMEOUT,
     _rewrite_singularity_argv,
     _singularity_safe_ref,
+    _dockerfile_dep_layers,
 )
 
 
@@ -239,3 +240,85 @@ def test_timeout_floor_proxies_other_attrs():
     inner.marker = 123
     client = _TimeoutFloorClient(inner, floor=86400)
     assert client.marker == 123  # __getattr__ passthrough
+
+
+# --------------------------------------------------------------------------- #
+# Dockerfile dep-layer parser
+# --------------------------------------------------------------------------- #
+
+def _write_dockerfile(text: str):
+    from pathlib import Path
+    import tempfile
+    d = Path(tempfile.mkdtemp())
+    df = d / "Dockerfile"
+    df.write_text(text)
+    return df
+
+
+def test_dep_layers_none_for_bare_from_workdir():
+    df = _write_dockerfile("FROM gcc:13\nWORKDIR /workspace\n")
+    assert _dockerfile_dep_layers(df) is None
+
+
+def test_dep_layers_single_run():
+    df = _write_dockerfile(
+        "FROM gcc:13\n"
+        "RUN apt-get update && apt-get install -y python3\n"
+    )
+    frag = _dockerfile_dep_layers(df)
+    assert frag is not None
+    assert "%post" in frag
+    assert "apt-get update && apt-get install -y python3" in frag
+    assert "%files" not in frag
+
+
+def test_dep_layers_multiline_run_continuation():
+    df = _write_dockerfile(
+        "FROM gcc:13\n"
+        "RUN apt-get update && \\\n"
+        "    apt-get install -y python3 nlohmann-json3-dev\n"
+    )
+    frag = _dockerfile_dep_layers(df)
+    assert frag is not None
+    # continuation folded into one line
+    assert "apt-get update && apt-get install -y python3 nlohmann-json3-dev" in frag
+
+
+def test_dep_layers_copy_becomes_files_and_mkdir():
+    df = _write_dockerfile(
+        "FROM golang:1.24\n"
+        "COPY setup.py /app/\n"
+    )
+    frag = _dockerfile_dep_layers(df)
+    assert frag is not None
+    assert "%files" in frag
+    assert "setup.py /app/" in frag
+    assert "mkdir -p /app/" in frag
+
+
+def test_dep_layers_env_becomes_environment():
+    df = _write_dockerfile(
+        "FROM rust:1.90\n"
+        "ENV PATH=/usr/bin:$PATH\n"
+        "RUN python3 --version\n"
+    )
+    frag = _dockerfile_dep_layers(df)
+    assert frag is not None
+    assert "%environment" in frag
+    assert "export PATH=/usr/bin:$PATH" in frag
+    assert "python3 --version" in frag
+
+
+def test_dep_layers_comments_and_other_instructions_ignored():
+    df = _write_dockerfile(
+        "# a comment\n"
+        "FROM node:22\n"
+        "WORKDIR /app\n"
+        "RUN npm install -g typescript\n"
+        "USER node\n"
+    )
+    frag = _dockerfile_dep_layers(df)
+    assert frag is not None
+    assert "npm install -g typescript" in frag
+    assert "USER" not in frag
+    assert "WORKDIR" not in frag

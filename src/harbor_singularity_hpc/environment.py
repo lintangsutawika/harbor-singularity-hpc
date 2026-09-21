@@ -4,6 +4,10 @@
 ``SingularityEnvironment`` and adds, as small overrides, everything that
 previously lived as source patches against harbor:
 
+* **Dockerfile dep-layer baking** -- when a task's ``environment/Dockerfile`` has
+  ``RUN``/``COPY``/``ENV`` layers, layer them onto the base sif as a build-time
+  derived sif (cached by base+content hash), so singularity honors the Dockerfile
+  deps the way Modal/Docker do -- not just its ``FROM``.
 * **Dockerfile ``FROM`` fallback** -- run SWE-bench (and other Dockerfile-defined)
   tasks that set no ``[environment].docker_image`` in ``task.toml``.
 * **Writable sandbox rootfs** -- extract the image to a per-session *directory*
@@ -47,6 +51,7 @@ to harbor regardless.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import os
 import shutil
 import signal
@@ -171,6 +176,117 @@ def _singularity_safe_ref(ref: str) -> str:
     return f"{name_tag}@{digest}"
 
 
+def _dockerfile_dep_layers(dockerfile: Path) -> str | None:
+    """Translate a task ``environment/Dockerfile``'s dependency-bearing
+    instructions (``RUN``/``COPY``/``ENV``) into a Singularity recipe fragment
+    (a ``%post``/``%files``/``%environment`` block) layered onto the base image.
+
+    Returns ``None`` when the Dockerfile carries no such layers (e.g. the common
+    ``FROM <base>`` + ``WORKDIR`` only), so the plain base sif is used unchanged.
+    The fragment is intended to be appended to a ``Bootstrap: localimage`` +
+    ``From: <base sif>`` recipe so ``singularity build`` bakes the ``RUN`` deps
+    in -- mirroring what Modal/Docker build from the same Dockerfile.
+
+    Line continuations (``\\``) and `#` comments are handled. ``COPY`` sources are
+    left as-is (resolved relative to the build context = the task's
+    ``environment/`` dir at build time); the destination directory is created.
+    ``ENV K=V`` (and ``ENV K V``) become ``export`` lines in ``%environment``.
+    """
+    if not dockerfile.exists():
+        return None
+    posts: list[str] = []
+    files: list[str] = []
+    envs: list[str] = []
+    current: list[str] | None = None      # RUN continuation buffer
+    try:
+        lines = dockerfile.read_text().splitlines()
+    except OSError:
+        return None
+
+    def flush_run() -> None:
+        nonlocal current
+        if current:
+            block = " ".join(ln.strip() for ln in current).strip()
+            if block:
+                posts.append(block)
+            current = None
+
+    i = 0
+    while i < len(lines):
+        raw = lines[i]
+        line = raw.strip()
+        # While inside a folded RUN (a prior line ended in backslash), consume
+        # the continuation: a line still ending in backslash keeps folding, a
+        # plain line is the final continuation line.
+        if current is not None:
+            if raw.rstrip().endswith("\\"):
+                current.append(raw[: raw.rindex("\\")].strip())
+                i += 1
+                continue
+            current.append(raw.strip())
+            flush_run()
+            i += 1
+            continue
+
+        if not line or line.startswith("#"):
+            i += 1
+            continue
+        upper = line.upper()
+        if upper.startswith("RUN "):
+            flush_run()
+            body = line[4:].strip()
+            if raw.rstrip().endswith("\\"):
+                current = [body[: body.rindex("\\")].strip()]
+            else:
+                current = None
+                posts.append(body)
+            i += 1
+            continue
+        if upper.startswith("COPY "):
+            flush_run()
+            parts = line[5:].split()
+            if len(parts) >= 2:
+                srcs, dst = parts[:-1], parts[-1]
+                for src in srcs:
+                    files.append(f"    {src} {dst}")
+                posts.append(f"mkdir -p {dst}")
+            i += 1
+            continue
+        if upper.startswith("ENV "):
+            flush_run()
+            body = line[4:].strip()
+            if "=" in body:
+                k, _, v = body.partition("=")
+                envs.append(f"    export {k.strip()}={v.strip()}")
+            else:
+                bits = body.split(None, 1)
+                if len(bits) == 2:
+                    envs.append(f"    export {bits[0]}={bits[1]}")
+            i += 1
+            continue
+        # Any other instruction (FROM/WORKDIR/USER/...): stop a RUN buffer.
+        flush_run()
+        i += 1
+
+    flush_run()
+
+    if not (posts or files or envs):
+        return None
+
+    block = []
+    if files:
+        block.append("%files")
+        block.extend(files)
+    if posts:
+        block.append("%post")
+        block.append("    set -e")
+        block.extend(f"    {p}" for p in posts)
+    if envs:
+        block.append("%environment")
+        block.extend(envs)
+    return "\n".join(block) + "\n"
+
+
 class _TimeoutFloorClient:
     """Transparent proxy over harbor's httpx exec client that raises a request
     whose timeout is exactly harbor's default (i.e. the no-``timeout_sec`` exec
@@ -233,7 +349,7 @@ class SingularityWritableEnvironment(SingularityEnvironment):
     invocation."""
 
     # Package version marker. Bump when the override behaviour changes.
-    _HB_HPC_PATCHSET = "3"
+    _HB_HPC_PATCHSET = "4"
 
     # Process-wide throttle on concurrent ``singularity pull``s. Many at once race
     # the shared OCI blob cache and burst Docker Hub's rate limit. Agent
@@ -394,12 +510,79 @@ class SingularityWritableEnvironment(SingularityEnvironment):
                 f"Failed to convert Docker image after {_MAX_PULL_ATTEMPTS} attempts: {last_error}"
             )
 
+
+    # -- Dockerfile dep-layers -> derived sif -----------------------------
+
+    async def _ensure_dockerfile_derived_sif(self, base_sif: Path) -> Path:
+        """If the task's ``environment/Dockerfile`` carries dependency layers
+        (``RUN``/``COPY``/``ENV``), build a derived sif that layers them onto
+        ``base_sif`` and return it; otherwise return ``base_sif`` unchanged.
+
+        This makes singularity honor the Dockerfile the way Modal/Docker do --
+        the deps are baked in at build time instead of being silently skipped
+        (stock singularity only reads the Dockerfile's ``FROM``). The derived
+        sif is cached in the node-local image cache keyed by a hash of the base
+        sif path + the Dockerfile content, so it is built once per (base, task)
+        -- never per trial. ``%files`` COPY sources resolve against the task's
+        ``environment/`` dir (the build context).
+        """
+        if not self._dockerfile_path.exists():
+            return base_sif
+        fragment = _dockerfile_dep_layers(self._dockerfile_path)
+        if not fragment:
+            return base_sif
+        dockerfile_text = self._dockerfile_path.read_text()
+        key = hashlib.sha256(
+            f"{base_sif}::{dockerfile_text}".encode()
+        ).hexdigest()[:16]
+        derived = self._image_cache_dir / f"df_{key}.sif"
+        if derived.exists():
+            return derived
+
+        self._image_cache_dir.mkdir(parents=True, exist_ok=True)
+        def_path = self._image_cache_dir / f"df_{key}.def"
+        def_path.write_text(
+            "Bootstrap: localimage\n"
+            f"From: {base_sif}\n"
+            f"\n"
+            f"{fragment}"
+        )
+        cmd = [
+            "singularity", "build", "--fakeroot",
+            str(derived), str(def_path),
+        ]
+        self.logger.info(
+            f"Building derived sif from task Dockerfile (deps): {' '.join(cmd)}"
+        )
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            cwd=str(self.environment_dir),   # COPY sources resolve here
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        out, _ = await proc.communicate()
+        if proc.returncode != 0:
+            self.logger.warning(
+                f"Dockerfile derived-sif build failed ({proc.returncode}); "
+                f"falling back to base sif. Output: "
+                f"{out.decode(errors='replace')[-2000:]}"
+            )
+            return base_sif
+        return derived
+
     # -- server launch (writable sandbox + exec timeout floor) ------------
 
     async def _start_server(self) -> None:
-        # Build the writable sandbox from the freshly-pulled sif and register it
-        # so _rewrite_singularity_argv redirects the exec harbor is about to
-        # launch. harbor's stock start() assigns self._sif_path before calling us.
+        # If the task Dockerfile adds dependency layers, bake them into a derived
+        # sif and sandbox THAT, so singularity honors RUN/COPY/ENV like Modal/Docker.
+        if self._sif_path is not None and self._dockerfile_path.exists():
+            try:
+                self._sif_path = await self._ensure_dockerfile_derived_sif(self._sif_path)
+            except Exception as exc:            # never let dep-layering break the run
+                self.logger.warning(f"Dockerfile dep-layering skipped: {exc}")
+        # Build the writable sandbox from the (possibly derived) sif and register
+        # it so _rewrite_singularity_argv redirects the exec harbor launches.
+        # harbor's stock start() assigns self._sif_path before calling us.
         if self._writable_sandbox and self._sandbox_path is None and self._sif_path is not None:
             self._sandbox_path = await self._build_writable_sandbox(self._sif_path)
             type(self)._WRITABLE_REGISTRY[str(self._sif_path)] = self._sandbox_path
