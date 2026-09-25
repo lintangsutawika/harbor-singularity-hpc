@@ -24,7 +24,7 @@ from harbor_singularity_hpc.environment import (
     _HARBOR_DEFAULT_HTTP_TIMEOUT,
     _rewrite_singularity_argv,
     _singularity_safe_ref,
-    _dockerfile_dep_layers,
+    _dockerfile_layers,
 )
 
 
@@ -255,61 +255,127 @@ def _write_dockerfile(text: str):
     return df
 
 
-def test_dep_layers_none_for_bare_from_workdir():
+def _frags(df):
+    return [frag for _, frag in _dockerfile_layers(df)]
+
+
+def test_layers_empty_for_bare_from_workdir():
     df = _write_dockerfile("FROM gcc:13\nWORKDIR /workspace\n")
-    assert _dockerfile_dep_layers(df) is None
+    assert _dockerfile_layers(df) == []
 
 
-def test_dep_layers_single_run():
+def test_layers_single_run():
     df = _write_dockerfile(
         "FROM gcc:13\n"
         "RUN apt-get update && apt-get install -y python3\n"
     )
-    frag = _dockerfile_dep_layers(df)
-    assert frag is not None
+    (frag,) = _frags(df)
     assert "%post" in frag
-    assert "apt-get update && apt-get install -y python3" in frag
+    assert "( cd / && apt-get update && apt-get install -y python3 )" in frag
     assert "%files" not in frag
 
 
-def test_dep_layers_multiline_run_continuation():
+def test_layers_multiline_run_continuation():
     df = _write_dockerfile(
         "FROM gcc:13\n"
         "RUN apt-get update && \\\n"
+        "    # comment inside continuation\n"
         "    apt-get install -y python3 nlohmann-json3-dev\n"
     )
-    frag = _dockerfile_dep_layers(df)
-    assert frag is not None
-    # continuation folded into one line
+    (frag,) = _frags(df)
     assert "apt-get update && apt-get install -y python3 nlohmann-json3-dev" in frag
 
 
-def test_dep_layers_copy_becomes_files_and_mkdir():
+def test_layers_copy_is_staged_outside_tmp_and_replayed():
+    # singularity masks the image's /tmp during %post, so %files must never
+    # target the Dockerfile's own /tmp dest directly.
+    df = _write_dockerfile(
+        "FROM ubuntu:22.04\n"
+        "COPY base_install.sh /tmp/base_install.sh\n"
+        "RUN bash /tmp/base_install.sh && rm /tmp/base_install.sh\n"
+    )
+    (df.parent / "base_install.sh").write_text("echo hi\n")
+    (frag,) = _frags(df)
+    files = frag.split("%files\n", 1)[1].split("%post", 1)[0]
+    assert f"{df.parent.resolve()}/base_install.sh /.harbor-ctx/0" in files
+    assert all(not ln.split()[-1].startswith("/tmp") for ln in files.splitlines() if ln.strip())
+    post = frag.split("%post", 1)[1]
+    assert post.index("cp -a /.harbor-ctx/0 /tmp/base_install.sh") < post.index("bash /tmp/base_install.sh")
+
+
+def test_layers_copy_dir_and_trailing_slash():
     df = _write_dockerfile(
         "FROM golang:1.24\n"
         "COPY setup.py /app/\n"
+        "COPY fixtures /app/fixtures\n"
     )
-    frag = _dockerfile_dep_layers(df)
-    assert frag is not None
-    assert "%files" in frag
-    assert "setup.py /app/" in frag
-    assert "mkdir -p /app/" in frag
+    (df.parent / "setup.py").write_text("")
+    (df.parent / "fixtures").mkdir()
+    (df.parent / "fixtures" / "a.txt").write_text("a")
+    (frag,) = _frags(df)
+    assert "mkdir -p /app && cp -a /.harbor-ctx/0 /app/setup.py" in frag
+    assert "mkdir -p /app/fixtures && cp -a /.harbor-ctx/1/. /app/fixtures/" in frag
 
 
-def test_dep_layers_env_becomes_environment():
+def test_layers_missing_copy_source_raises():
+    df = _write_dockerfile("FROM ubuntu:22.04\nCOPY nope.sh /tmp/nope.sh\n")
+    with pytest.raises(FileNotFoundError):
+        _dockerfile_layers(df)
+
+
+def test_layers_env_exported_for_later_runs_and_runtime():
     df = _write_dockerfile(
         "FROM rust:1.90\n"
+        "ENV DEBIAN_FRONTEND=noninteractive\n"
         "ENV PATH=/usr/bin:$PATH\n"
         "RUN python3 --version\n"
     )
-    frag = _dockerfile_dep_layers(df)
-    assert frag is not None
-    assert "%environment" in frag
-    assert "export PATH=/usr/bin:$PATH" in frag
-    assert "python3 --version" in frag
+    (frag,) = _frags(df)
+    post = frag.split("%post", 1)[1].split("%environment", 1)[0]
+    assert post.index("export DEBIAN_FRONTEND=noninteractive") < post.index("python3 --version")
+    env = frag.split("%environment", 1)[1]
+    assert "export PATH=/usr/bin:$PATH" in env
 
 
-def test_dep_layers_comments_and_other_instructions_ignored():
+def test_layers_split_at_copy_after_run_and_share_prefix_key():
+    def build(post_script):
+        df = _write_dockerfile(
+            "FROM ubuntu:22.04\n"
+            "ENV LANG=C.UTF-8\n"
+            "COPY base_install.sh /tmp/base_install.sh\n"
+            "RUN bash /tmp/base_install.sh\n"
+            "COPY post_install.sh /tmp/post_install.sh\n"
+            "RUN bash /tmp/post_install.sh\n"
+        )
+        (df.parent / "base_install.sh").write_text("apt-get install -y python3\n")
+        (df.parent / "post_install.sh").write_text(post_script)
+        return _dockerfile_layers(df)
+
+    a, b = build("echo a\n"), build("echo b\n")
+    assert len(a) == 2
+    assert a[0][0] == b[0][0]          # shared base layer -> same cache key
+    assert a[1][0] != b[1][0]          # task-specific layer differs by content
+    # the second layer inherits the first's ENV via the base image's
+    # %environment (appended per layer), so it is declared only once
+    assert "LANG" not in a[1][1]
+    assert "export LANG=C.UTF-8" in a[0][1].split("%environment", 1)[1]
+
+
+def test_layers_arg_reexported_in_later_layers():
+    df = _write_dockerfile(
+        "FROM ubuntu:22.04\n"
+        "ARG VERSION=1.2\n"
+        "RUN echo $VERSION\n"
+        "COPY x.sh /x.sh\n"
+        "RUN echo $VERSION\n"
+    )
+    (df.parent / "x.sh").write_text("")
+    first, second = _frags(df)
+    assert "export VERSION=1.2" in second.split("%post", 1)[1]
+    assert "VERSION" not in first.split("%environment", 1)[-1] or "%environment" not in first
+
+
+def test_layers_workdir_applies_to_runs_and_other_instructions_ignored():
     df = _write_dockerfile(
         "# a comment\n"
         "FROM node:22\n"
@@ -317,8 +383,6 @@ def test_dep_layers_comments_and_other_instructions_ignored():
         "RUN npm install -g typescript\n"
         "USER node\n"
     )
-    frag = _dockerfile_dep_layers(df)
-    assert frag is not None
-    assert "npm install -g typescript" in frag
+    (frag,) = _frags(df)
+    assert "( cd /app && npm install -g typescript )" in frag
     assert "USER" not in frag
-    assert "WORKDIR" not in frag
