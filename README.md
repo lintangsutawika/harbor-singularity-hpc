@@ -27,6 +27,7 @@ Singularity at scale:
 | Behaviour | What it does |
 |---|---|
 | **Dockerfile `FROM` fallback** | SWE-bench tasks set no `[environment].docker_image`; they declare the image via `FROM …` in `environment/Dockerfile`, which harbor's Singularity backend never builds. We parse that `FROM` and pull it. |
+| **Dockerfile layer baking** | The task Dockerfile's `RUN`/`COPY`/`ENV`/`ARG`/`WORKDIR` are baked onto the base sif as a chain of derived sifs (one per `COPY`-after-`RUN` boundary), cached node-locally by base + instructions + COPY-source contents, so a shared prefix like `base_install.sh` builds once per node. COPY sources are staged at `/.harbor-ctx` and replayed in `%post` (singularity masks the image's `/tmp` there), and `%post` gets a private 1777 `/tmp`. A failed bake fails the trial, like a failed image build. Build logs sit next to each layer as `df_<key>.log`. |
 | **Writable sandbox rootfs** | `--fakeroot --writable <dir>` instead of `--writable-tmpfs <sif>`; bind destinations and `--pwd` are pre-created in the sandbox (a `--writable` rootfs can't auto-create mountpoints). |
 | **Node-local, resume-safe cache** | Default image cache resolves **live** to `$PBS_LOCALDIR` / `$SLURM_TMPDIR`, so a path is never baked stale into a chunked-resume job config. |
 | **Pull retry + semaphore** | Bounded retries around `singularity pull` and a process-wide pull throttle, to ride out Docker Hub's *"unexpected end of JSON input"* under concurrency. |

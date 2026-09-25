@@ -5,9 +5,10 @@
 previously lived as source patches against harbor:
 
 * **Dockerfile dep-layer baking** -- when a task's ``environment/Dockerfile`` has
-  ``RUN``/``COPY``/``ENV`` layers, layer them onto the base sif as a build-time
-  derived sif (cached by base+content hash), so singularity honors the Dockerfile
-  deps the way Modal/Docker do -- not just its ``FROM``.
+  ``RUN``/``COPY``/``ENV`` layers, bake them onto the base sif as a chain of derived
+  sifs (node-local, cached per layer by base+instructions+COPY-source contents), so
+  singularity honors the Dockerfile the way Modal/Docker do -- not just its ``FROM``.
+  A failed bake fails the trial, as a failed image build would.
 * **Dockerfile ``FROM`` fallback** -- run SWE-bench (and other Dockerfile-defined)
   tasks that set no ``[environment].docker_image`` in ``task.toml``.
 * **Writable sandbox rootfs** -- extract the image to a per-session *directory*
@@ -51,8 +52,11 @@ to harbor regardless.
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import hashlib
+import json
 import os
+import shlex
 import shutil
 import signal
 import subprocess
@@ -176,115 +180,191 @@ def _singularity_safe_ref(ref: str) -> str:
     return f"{name_tag}@{digest}"
 
 
-def _dockerfile_dep_layers(dockerfile: Path) -> str | None:
-    """Translate a task ``environment/Dockerfile``'s dependency-bearing
-    instructions (``RUN``/``COPY``/``ENV``) into a Singularity recipe fragment
-    (a ``%post``/``%files``/``%environment`` block) layered onto the base image.
+# Where COPY sources are staged inside the image during a bake. ``%files`` targets
+# under ``/tmp`` (the usual Dockerfile staging dir) are invisible to ``%post``:
+# singularity binds a host ``/tmp`` over the image's during the build, so
+# ``COPY x.sh /tmp/x.sh`` + ``RUN bash /tmp/x.sh`` dies with "No such file". Staging
+# every source here and replaying the COPY inside ``%post`` sidesteps the mask.
+_BAKE_CTX = "/.harbor-ctx"
 
-    Returns ``None`` when the Dockerfile carries no such layers (e.g. the common
-    ``FROM <base>`` + ``WORKDIR`` only), so the plain base sif is used unchanged.
-    The fragment is intended to be appended to a ``Bootstrap: localimage`` +
-    ``From: <base sif>`` recipe so ``singularity build`` bakes the ``RUN`` deps
-    in -- mirroring what Modal/Docker build from the same Dockerfile.
 
-    Line continuations (``\\``) and `#` comments are handled. ``COPY`` sources are
-    left as-is (resolved relative to the build context = the task's
-    ``environment/`` dir at build time); the destination directory is created.
-    ``ENV K=V`` (and ``ENV K V``) become ``export`` lines in ``%environment``.
+def _parse_dockerfile(dockerfile: Path) -> list[tuple[str, Any]]:
+    """Parse a Dockerfile into ``(instruction, arg)`` steps, in order.
+
+    Folds ``\\`` line continuations and drops comments. Only the instructions
+    that shape the filesystem or build env are kept: ``RUN`` (arg: shell text),
+    ``COPY``/``ADD`` (arg: ``(srcs, dst)``), ``ENV``/``ARG`` (arg: the raw body)
+    and ``WORKDIR`` (arg: path). ``FROM``/``USER``/``CMD``/... are dropped.
     """
     if not dockerfile.exists():
-        return None
-    posts: list[str] = []
-    files: list[str] = []
-    envs: list[str] = []
-    current: list[str] | None = None      # RUN continuation buffer
+        return []
     try:
         lines = dockerfile.read_text().splitlines()
     except OSError:
-        return None
+        return []
 
-    def flush_run() -> None:
-        nonlocal current
-        if current:
-            block = " ".join(ln.strip() for ln in current).strip()
-            if block:
-                posts.append(block)
-            current = None
-
-    i = 0
-    while i < len(lines):
-        raw = lines[i]
+    logical: list[str] = []
+    buf: list[str] = []
+    for raw in lines:
         line = raw.strip()
-        # While inside a folded RUN (a prior line ended in backslash), consume
-        # the continuation: a line still ending in backslash keeps folding, a
-        # plain line is the final continuation line.
-        if current is not None:
-            if raw.rstrip().endswith("\\"):
-                current.append(raw[: raw.rindex("\\")].strip())
-                i += 1
-                continue
-            current.append(raw.strip())
-            flush_run()
-            i += 1
+        if not buf and (not line or line.startswith("#")):
             continue
+        if buf and line.startswith("#"):       # comments inside a continuation
+            continue
+        if line.endswith("\\"):
+            buf.append(line[:-1].strip())
+            continue
+        buf.append(line)
+        logical.append(" ".join(b for b in buf if b))
+        buf = []
+    if buf:
+        logical.append(" ".join(b for b in buf if b))
 
-        if not line or line.startswith("#"):
-            i += 1
-            continue
-        upper = line.upper()
-        if upper.startswith("RUN "):
-            flush_run()
-            body = line[4:].strip()
-            if raw.rstrip().endswith("\\"):
-                current = [body[: body.rindex("\\")].strip()]
-            else:
-                current = None
-                posts.append(body)
-            i += 1
-            continue
-        if upper.startswith("COPY "):
-            flush_run()
-            parts = line[5:].split()
+    steps: list[tuple[str, Any]] = []
+    for line in logical:
+        head, _, body = line.partition(" ")
+        op = head.upper()
+        body = body.strip()
+        if op == "RUN":
+            if body.startswith("["):           # exec form: RUN ["bash", "-c", "..."]
+                try:
+                    body = shlex.join(json.loads(body))
+                except ValueError:
+                    pass
+            steps.append(("RUN", body))
+        elif op in ("COPY", "ADD"):
+            parts = [p for p in shlex.split(body) if not p.startswith("--")]
+            if any(p.startswith("--from") for p in shlex.split(body)):
+                raise ValueError(f"multi-stage COPY is not supported: {line}")
             if len(parts) >= 2:
-                srcs, dst = parts[:-1], parts[-1]
+                steps.append(("COPY", (parts[:-1], parts[-1])))
+        elif op in ("ENV", "ARG"):
+            if body:
+                steps.append((op, body))
+        elif op == "WORKDIR":
+            steps.append(("WORKDIR", body))
+    return steps
+
+
+def _env_export(op: str, body: str) -> str:
+    """``ENV K=V ...`` / legacy ``ENV K V`` / ``ARG K[=V]`` -> a shell ``export``."""
+    if op == "ARG" and "=" not in body:
+        return ""                              # bare ARG: nothing to set
+    if "=" in body.split(None, 1)[0]:
+        return f"export {body}"
+    key, _, value = body.partition(" ")
+    return f'export {key}="{value.strip()}"'
+
+
+def _dockerfile_layers(dockerfile: Path, build_context: Path | None = None) -> list[tuple[str, str]]:
+    """Translate a task Dockerfile into a chain of Singularity recipe fragments.
+
+    Returns ``[(cache_material, fragment), ...]`` -- one entry per layer, each to be
+    built with ``Bootstrap: localimage`` on top of the previous layer's sif -- or
+    ``[]`` when the Dockerfile has no ``RUN``/``COPY``/``ENV`` (serve the base sif).
+
+    A new layer starts at every ``COPY`` that follows a ``RUN``, so a shared prefix
+    (e.g. ``COPY base_install.sh`` + ``RUN bash base_install.sh``) builds once and is
+    reused by every task whose prefix is byte-identical -- Docker's layer cache, at
+    COPY granularity. ``cache_material`` covers the instructions *and* the contents
+    of every COPY source up to and including that layer.
+
+    Semantics follow ``docker build``: each ``RUN`` runs in its own subshell from the
+    current ``WORKDIR`` with every prior ``ENV``/``ARG`` exported; ``COPY`` sources
+    resolve against ``build_context`` (default: the Dockerfile's dir); ``ENV`` also
+    lands in the ``%environment`` of the layer that sets it so the agent and
+    verifier see it at runtime.
+    """
+    steps = _parse_dockerfile(dockerfile)
+    if not any(op in ("RUN", "COPY", "ENV") for op, _ in steps):
+        return []
+    ctx = (build_context or dockerfile.parent).resolve()
+
+    # Group into layers: close the current layer when a COPY follows a RUN.
+    groups: list[list[tuple[str, Any]]] = [[]]
+    seen_run = False
+    for op, arg in steps:
+        if op == "COPY" and seen_run:
+            groups.append([])
+            seen_run = False
+        groups[-1].append((op, arg))
+        seen_run = seen_run or op == "RUN"
+
+    layers: list[tuple[str, str]] = []
+    material = hashlib.sha256()
+    envs: list[tuple[str, str]] = []           # (op, body), cumulative across layers
+    workdir = "/"
+    for group in groups:
+        files: list[str] = []
+        ops: list[str] = []
+        # %post already sources the base image's %environment (earlier layers'
+        # ENV); only build-time ARGs need re-exporting.
+        prelude = [e for e in (_env_export(o, b) for o, b in envs if o == "ARG") if e]
+        start_workdir = workdir
+        for op, arg in group:
+            material.update(f"{op}\0{arg!r}\n".encode())
+            if op in ("ENV", "ARG"):
+                envs.append((op, arg))
+                ops.append(_env_export(op, arg))
+            elif op == "WORKDIR":
+                workdir = arg if arg.startswith("/") else f"{workdir.rstrip('/')}/{arg}"
+                ops.append(f"mkdir -p {shlex.quote(workdir)} && cd {shlex.quote(workdir)}")
+            elif op == "RUN":
+                ops.append(f"( cd {shlex.quote(workdir)} && {arg} )")
+            elif op == "COPY":
+                srcs, dst = arg
+                matches: list[Path] = []
                 for src in srcs:
-                    files.append(f"    {src} {dst}")
-                posts.append(f"mkdir -p {dst}")
-            i += 1
-            continue
-        if upper.startswith("ENV "):
-            flush_run()
-            body = line[4:].strip()
-            if "=" in body:
-                k, _, v = body.partition("=")
-                envs.append(f"    export {k.strip()}={v.strip()}")
-            else:
-                bits = body.split(None, 1)
-                if len(bits) == 2:
-                    envs.append(f"    export {bits[0]}={bits[1]}")
-            i += 1
-            continue
-        # Any other instruction (FROM/WORKDIR/USER/...): stop a RUN buffer.
-        flush_run()
-        i += 1
+                    hits = sorted(ctx.glob(src)) if any(c in src for c in "*?[") else [ctx / src]
+                    matches.extend(h.resolve() for h in hits)
+                into_dir = dst.endswith("/") or len(matches) > 1
+                qdst = shlex.quote(dst.rstrip("/") or "/")
+                for src_path in matches:
+                    if not src_path.exists():
+                        raise FileNotFoundError(f"COPY source not in build context: {src_path}")
+                    material.update(_path_digest(src_path).encode())
+                    staged = f"{_BAKE_CTX}/{len(files)}"
+                    files.append(f"    {src_path} {staged}")
+                    if src_path.is_dir():           # docker copies a dir's *contents*
+                        ops.append(f"mkdir -p {qdst} && cp -a {staged}/. {qdst}/")
+                    elif into_dir:
+                        ops.append(f"mkdir -p {qdst} && cp -a {staged} {qdst}/{shlex.quote(src_path.name)}")
+                    else:
+                        ops.append(
+                            f"if [ -d {qdst} ]; then cp -a {staged} {qdst}/{shlex.quote(src_path.name)}; "
+                            f'else mkdir -p "$(dirname {qdst})" && cp -a {staged} {qdst}; fi'
+                        )
+        # singularity *appends* each layer's %environment to the base image's, so
+        # emit only the ENVs this layer introduces (cumulative would re-apply e.g.
+        # PATH=/x:$PATH once per layer).
+        env_lines = [_env_export(op, arg) for op, arg in group if op == "ENV"]
 
-    flush_run()
-
-    if not (posts or files or envs):
-        return None
-
-    block = []
-    if files:
-        block.append("%files")
-        block.extend(files)
-    if posts:
+        block: list[str] = []
+        if files:
+            block.append("%files")
+            block.extend(files)
         block.append("%post")
         block.append("    set -e")
-        block.extend(f"    {p}" for p in posts)
-    if envs:
-        block.append("%environment")
-        block.extend(envs)
-    return "\n".join(block) + "\n"
+        block.extend(f"    {p}" for p in prelude)
+        block.append(f"    mkdir -p {shlex.quote(start_workdir)} && cd {shlex.quote(start_workdir)}")
+        block.extend(f"    {o}" for o in ops if o)
+        if files:
+            block.append(f"    rm -rf {_BAKE_CTX}")
+        if env_lines:
+            block.append("%environment")
+            block.extend(f"    {e}" for e in env_lines)
+        layers.append((material.hexdigest(), "\n".join(block) + "\n"))
+    return layers
+
+
+def _path_digest(path: Path) -> str:
+    """Content digest of a COPY source (file, or every file under a dir)."""
+    h = hashlib.sha256()
+    paths = sorted(p for p in path.rglob("*") if p.is_file()) if path.is_dir() else [path]
+    for p in paths:
+        h.update(str(p.relative_to(path) if path.is_dir() else p.name).encode())
+        h.update(p.read_bytes())
+    return h.hexdigest()
 
 
 class _TimeoutFloorClient:
@@ -514,61 +594,77 @@ class SingularityWritableEnvironment(SingularityEnvironment):
     # -- Dockerfile dep-layers -> derived sif -----------------------------
 
     async def _ensure_dockerfile_derived_sif(self, base_sif: Path) -> Path:
-        """If the task's ``environment/Dockerfile`` carries dependency layers
-        (``RUN``/``COPY``/``ENV``), build a derived sif that layers them onto
-        ``base_sif`` and return it; otherwise return ``base_sif`` unchanged.
+        """Bake the task's ``environment/Dockerfile`` onto ``base_sif`` and return
+        the resulting sif (``base_sif`` itself if the Dockerfile has nothing to bake).
 
-        This makes singularity honor the Dockerfile the way Modal/Docker do --
-        the deps are baked in at build time instead of being silently skipped
-        (stock singularity only reads the Dockerfile's ``FROM``). The derived
-        sif is cached in the node-local image cache keyed by a hash of the base
-        sif path + the Dockerfile content, so it is built once per (base, task)
-        -- never per trial. ``%files`` COPY sources resolve against the task's
-        ``environment/`` dir (the build context).
+        This makes singularity honor the Dockerfile the way Modal/Docker do -- stock
+        singularity only reads its ``FROM``, silently skipping the ``RUN``/``COPY``/
+        ``ENV`` layers that install e.g. the verifier's pytest. Layers (see
+        ``_dockerfile_layers``) are built as a chain of derived sifs in the node-local
+        image cache, each keyed by the base sif + instructions + COPY-source contents,
+        so a layer is built once per node and shared by every trial/task that reuses
+        it. A file lock serializes concurrent builders of the same layer.
+
+        A failed build raises (as a failed ``docker build`` / Modal image build
+        would) instead of silently running the task in an unprovisioned container.
         """
-        if not self._dockerfile_path.exists():
+        layers = _dockerfile_layers(self._dockerfile_path, self.environment_dir)
+        if not layers:
             return base_sif
-        fragment = _dockerfile_dep_layers(self._dockerfile_path)
-        if not fragment:
-            return base_sif
-        dockerfile_text = self._dockerfile_path.read_text()
-        key = hashlib.sha256(
-            f"{base_sif}::{dockerfile_text}".encode()
-        ).hexdigest()[:16]
-        derived = self._image_cache_dir / f"df_{key}.sif"
-        if derived.exists():
-            return derived
-
         self._image_cache_dir.mkdir(parents=True, exist_ok=True)
-        def_path = self._image_cache_dir / f"df_{key}.def"
-        def_path.write_text(
-            "Bootstrap: localimage\n"
-            f"From: {base_sif}\n"
-            f"\n"
-            f"{fragment}"
-        )
+        current = base_sif
+        for n, (material, fragment) in enumerate(layers, 1):
+            key = hashlib.sha256(f"{current}::{material}".encode()).hexdigest()[:16]
+            derived = self._image_cache_dir / f"df_{key}.sif"
+            lock_path = self._image_cache_dir / f"df_{key}.lock"
+            lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR)
+            try:
+                await asyncio.to_thread(fcntl.flock, lock_fd, fcntl.LOCK_EX)
+                if not derived.exists():
+                    await self._build_derived_layer(current, fragment, derived, f"{n}/{len(layers)}")
+                else:
+                    self.logger.info(f"Reusing cached Dockerfile layer {n}/{len(layers)}: {derived}")
+            finally:
+                os.close(lock_fd)                 # releases the flock
+            current = derived
+        return current
+
+    async def _build_derived_layer(self, base: Path, fragment: str, out: Path, label: str) -> None:
+        def_path = out.with_suffix(".def")
+        def_path.write_text(f"Bootstrap: localimage\nFrom: {base}\n\n{fragment}")
+        tmp_out = out.with_name(f"{out.name}.tmp-{os.getpid()}")
+        # Give %post a private /tmp: singularity otherwise binds the host's shared
+        # /tmp, where concurrent builds' staged scripts would collide.
+        # World-writable + sticky like a real /tmp: apt drops to its ``_apt`` user and
+        # fails every fetch ("Couldn't create temporary file") under mkdtemp's 0700.
+        build_tmp = Path(tempfile.mkdtemp(prefix="df_tmp_", dir=self._image_cache_dir))
+        build_tmp.chmod(0o1777)
         cmd = [
-            "singularity", "build", "--fakeroot",
-            str(derived), str(def_path),
+            "singularity", "build", "--fakeroot", "--force",
+            "--bind", f"{build_tmp}:/tmp",
+            str(tmp_out), str(def_path),
         ]
-        self.logger.info(
-            f"Building derived sif from task Dockerfile (deps): {' '.join(cmd)}"
-        )
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            cwd=str(self.environment_dir),   # COPY sources resolve here
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-        )
-        out, _ = await proc.communicate()
-        if proc.returncode != 0:
-            self.logger.warning(
-                f"Dockerfile derived-sif build failed ({proc.returncode}); "
-                f"falling back to base sif. Output: "
-                f"{out.decode(errors='replace')[-2000:]}"
+        self.logger.info(f"Building Dockerfile layer {label}: {' '.join(cmd)}")
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                cwd=str(self.environment_dir),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
             )
-            return base_sif
-        return derived
+            output, _ = await proc.communicate()
+            log_path = out.with_suffix(".log")
+            log_path.write_bytes(output)
+            if proc.returncode != 0:
+                raise RuntimeError(
+                    f"Dockerfile layer {label} build failed ({proc.returncode}); "
+                    f"recipe {def_path}, log {log_path}. Output tail:\n"
+                    f"{output.decode(errors='replace')[-4000:]}"
+                )
+            os.replace(tmp_out, out)
+        finally:
+            tmp_out.unlink(missing_ok=True)
+            shutil.rmtree(build_tmp, ignore_errors=True)
 
     # -- server launch (writable sandbox + exec timeout floor) ------------
 
@@ -576,10 +672,7 @@ class SingularityWritableEnvironment(SingularityEnvironment):
         # If the task Dockerfile adds dependency layers, bake them into a derived
         # sif and sandbox THAT, so singularity honors RUN/COPY/ENV like Modal/Docker.
         if self._sif_path is not None and self._dockerfile_path.exists():
-            try:
-                self._sif_path = await self._ensure_dockerfile_derived_sif(self._sif_path)
-            except Exception as exc:            # never let dep-layering break the run
-                self.logger.warning(f"Dockerfile dep-layering skipped: {exc}")
+            self._sif_path = await self._ensure_dockerfile_derived_sif(self._sif_path)
         # Build the writable sandbox from the (possibly derived) sif and register
         # it so _rewrite_singularity_argv redirects the exec harbor launches.
         # harbor's stock start() assigns self._sif_path before calling us.
