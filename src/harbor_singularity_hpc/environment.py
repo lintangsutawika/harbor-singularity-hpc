@@ -28,6 +28,11 @@ previously lived as source patches against harbor:
 * **Docker Hub pull retry + a process-wide pull semaphore** -- survive the
   transient "unexpected end of JSON input" / "conveyor failed to get" failures
   that OCI pulls hit under concurrency.
+* **Per-process OOM kill** -- over the task's ``memory_mb``, SIGKILL the largest
+  process (as a Docker/Modal cgroup OOM killer would) instead of killing the whole
+  container and failing the trial; the agent sees exit 137 and carries on. Falls
+  back to the container kill when the hog is harbor's own ``server.py``. Opt out
+  with ``--environment-kwarg singularity_oom_kill_process=false``.
 * **Long exec HTTP timeout** -- mini-swe-agent runs its whole loop as a single
   ``exec`` with no ``timeout_sec``; harbor's 600s client cap kills it well under
   the trial's real budget. Raise the floor so the outer budget governs.
@@ -73,6 +78,9 @@ _HARBOR_DEFAULT_HTTP_TIMEOUT = 600
 
 # How many times to retry a flaky ``singularity pull`` before giving up.
 _MAX_PULL_ATTEMPTS = 5
+
+# Memory watchdog: act at 95% of the task's memory_mb (harbor's own threshold).
+_OOM_KILL_FRACTION = 0.95
 
 
 def _install_argv_rewrite() -> None:
@@ -422,6 +430,71 @@ def _descendant_pids(root_pid: int) -> list[int]:
     walk(root_pid)
     return descendants
 
+def _pss_bytes(pid: int) -> int:
+    """Proportional set size of one process in bytes (RSS fallback), 0 if gone."""
+    try:
+        for line in Path(f"/proc/{pid}/smaps_rollup").read_text().splitlines():
+            if line.startswith("Pss:"):
+                return int(line.split()[1]) * 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    try:
+        return int(Path(f"/proc/{pid}/statm").read_text().split()[1]) * os.sysconf("SC_PAGE_SIZE")
+    except (OSError, ValueError, IndexError):
+        return 0
+
+
+def _oom_victim(root_pid: int) -> tuple[int | None, int, int]:
+    """Pick what a cgroup OOM killer would kill in root_pid's tree.
+
+    Returns ``(victim_pid, victim_bytes, total_bytes)``. The victim is the
+    largest process by PSS, or ``None`` when that process is part of the
+    harness -- the singularity starter chain or harbor's in-container
+    ``server.py`` (and its ancestors) -- whose death would take the whole
+    container down anyway.
+    """
+    try:
+        out = subprocess.run(
+            ["ps", "-eo", "pid=,ppid="], capture_output=True, text=True, check=True
+        ).stdout
+    except Exception:
+        return None, 0, 0
+    parent: dict[int, int] = {}
+    for line in out.splitlines():
+        try:
+            pid_s, ppid_s = line.split()
+            parent[int(pid_s)] = int(ppid_s)
+        except ValueError:
+            continue
+
+    def in_tree(pid: int) -> bool:
+        seen = set()
+        while pid not in seen and pid > 1:
+            if pid == root_pid:
+                return True
+            seen.add(pid)
+            pid = parent.get(pid, 0)
+        return False
+
+    tree = [pid for pid in parent if in_tree(pid)]
+    protected = {root_pid}
+    for pid in tree:
+        try:
+            cmdline = Path(f"/proc/{pid}/cmdline").read_bytes()
+        except OSError:
+            continue
+        if b"server.py" in cmdline:
+            while pid in parent and pid not in protected:
+                protected.add(pid)
+                pid = parent[pid]
+    sizes = {pid: _pss_bytes(pid) for pid in tree}
+    total = sum(sizes.values())
+    if not sizes:
+        return None, 0, 0
+    biggest = max(sizes, key=sizes.__getitem__)
+    return (None if biggest in protected else biggest), sizes[biggest], total
+
+
 class SingularityWritableEnvironment(SingularityEnvironment):
     """``SingularityEnvironment`` that yields a writable rootfs on FUSE-restricted
     HPC nodes, runs Dockerfile-defined tasks, and hardens image pulls. See the
@@ -447,6 +520,7 @@ class SingularityWritableEnvironment(SingularityEnvironment):
         singularity_image_cache_dir: Path | str | None = None,
         singularity_writable_sandbox: bool = True,
         singularity_sandbox_dir: Path | str | None = None,
+        singularity_oom_kill_process: bool = True,
         **kwargs: Any,
     ) -> None:
         super().__init__(
@@ -462,6 +536,7 @@ class SingularityWritableEnvironment(SingularityEnvironment):
         self._writable_sandbox = singularity_writable_sandbox
         self._sandbox_dir_root = singularity_sandbox_dir
         self._sandbox_path: Path | None = None
+        self._oom_kill_process = singularity_oom_kill_process
         self._http_timeout_floor = int(
             os.environ.get("HB_SINGULARITY_HTTP_TIMEOUT", "86400")
         )
@@ -687,6 +762,59 @@ class SingularityWritableEnvironment(SingularityEnvironment):
         # trial budget rather than harbor's 600s default.
         if self._http_client is not None and not isinstance(self._http_client, _TimeoutFloorClient):
             self._http_client = _TimeoutFloorClient(self._http_client, self._http_timeout_floor)
+
+    # -- memory watchdog (OOM-kill the largest process, like a cgroup) ------
+
+    async def _memory_watchdog(self) -> None:
+        """Enforce the task's ``memory_mb`` the way Docker/Modal do.
+
+        Stock harbor kills the *whole container* once the process tree passes
+        95% of the limit, failing the trial with MemoryLimitExceededError. Under
+        Docker/Modal the cgroup OOM killer instead kills the largest process, the
+        agent sees its command die (exit 137) and carries on -- e.g. a LeetCode
+        solution stuck in an allocation loop while the agent tests it. Mirror
+        that: SIGKILL the largest process and keep watching. Fall back to the
+        stock container kill only when the hog is the harness itself (harbor's
+        ``server.py``, e.g. buffering a runaway command's output).
+        """
+        if not self._oom_kill_process:
+            return await super()._memory_watchdog()
+        if self._memory_limit_bytes is None:
+            return
+        limit = self._memory_limit_bytes * _OOM_KILL_FRACTION
+        limit_mb = limit / 1024 / 1024
+        while self._server_process and self._server_process.returncode is None:
+            try:
+                victim, victim_bytes, total = await asyncio.to_thread(
+                    _oom_victim, self._server_process.pid
+                )
+                if total > limit:
+                    total_mb = total / 1024 / 1024
+                    if victim is None:
+                        msg = (
+                            f"Container exceeded memory limit ({total_mb:.0f}MB > "
+                            f"{limit_mb:.0f}MB) in the harness itself"
+                        )
+                        self.logger.error(f"{msg}. Killing container.")
+                        self._memory_limit_exceeded = msg
+                        self._server_process.kill()
+                        return
+                    self.logger.warning(
+                        f"Memory limit exceeded ({total_mb:.0f}MB > {limit_mb:.0f}MB): "
+                        f"OOM-killing pid {victim} ({victim_bytes / 1024 / 1024:.0f}MB)"
+                    )
+                    try:
+                        os.kill(victim, signal.SIGKILL)
+                    except (ProcessLookupError, PermissionError):
+                        pass
+                    await asyncio.sleep(1)
+                    continue
+                await asyncio.sleep(1 if total > limit / 2 else 3)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self.logger.debug(f"Memory watchdog error (continuing): {exc}")
+                await asyncio.sleep(3)
 
     async def stop(self, delete: bool) -> None:
         # Harbor's stock stop() terminates the outer Singularity process before

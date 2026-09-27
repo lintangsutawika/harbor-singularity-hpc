@@ -31,6 +31,7 @@ Singularity at scale:
 | **Writable sandbox rootfs** | `--fakeroot --writable <dir>` instead of `--writable-tmpfs <sif>`; bind destinations and `--pwd` are pre-created in the sandbox (a `--writable` rootfs can't auto-create mountpoints). |
 | **Node-local, resume-safe cache** | Default image cache resolves **live** to `$PBS_LOCALDIR` / `$SLURM_TMPDIR`, so a path is never baked stale into a chunked-resume job config. |
 | **Pull retry + semaphore** | Bounded retries around `singularity pull` and a process-wide pull throttle, to ride out Docker Hub's *"unexpected end of JSON input"* under concurrency. |
+| **Per-process OOM kill** | Over the task's `memory_mb`, SIGKILL the largest process in the container, as a Docker/Modal cgroup OOM killer would, instead of killing the whole container and failing the trial with `MemoryLimitExceededError`. The agent sees its command die (exit 137) and carries on. Falls back to the container kill when the hog is harbor's own `server.py`. Opt out with `--ek singularity_oom_kill_process=false`. |
 | **Long exec HTTP timeout** | mini-swe-agent runs its whole loop as one `exec`; harbor's 600s client cap kills it. The floor is raised (default 86400s) so the trial's own budget governs. |
 
 ## Install

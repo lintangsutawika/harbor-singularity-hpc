@@ -25,6 +25,7 @@ from harbor_singularity_hpc.environment import (
     _rewrite_singularity_argv,
     _singularity_safe_ref,
     _dockerfile_layers,
+    _oom_victim,
 )
 
 
@@ -55,7 +56,8 @@ def test_subclass_relationship():
 
 @pytest.mark.parametrize(
     "name", ["_docker_image", "_dockerfile_path", "_convert_docker_to_sif",
-             "_start_server", "start", "stop"],
+             "_start_server", "start", "stop", "_memory_watchdog",
+             "_get_process_tree_memory"],
 )
 def test_base_still_has_seam(name):
     assert hasattr(SingularityEnvironment, name), (
@@ -386,3 +388,67 @@ def test_layers_workdir_applies_to_runs_and_other_instructions_ignored():
     (frag,) = _frags(df)
     assert "( cd /app && npm install -g typescript )" in frag
     assert "USER" not in frag
+
+
+# -- per-process OOM kill ---------------------------------------------------
+
+_needs_proc = pytest.mark.skipif(
+    not Path("/proc/self/smaps_rollup").exists(), reason="needs Linux /proc"
+)
+
+
+def _spawn_tree(big_is_server: bool):
+    """root -> {hog, server.py stand-in}; the one named by big_is_server holds ~300MB."""
+    import subprocess, sys, time
+    hog = "x = bytearray(300 * 1024 * 1024); x[::4096] = b'1' * len(x[::4096]); import time; time.sleep(60)"
+    idle = "import time; time.sleep(60)"
+    server_code, other_code = (hog, idle) if big_is_server else (idle, hog)
+    root = subprocess.Popen([
+        sys.executable, "-c",
+        "import subprocess, sys, time\n"
+        f"subprocess.Popen([sys.executable, '-c', {server_code!r}, 'server.py'])\n"
+        f"subprocess.Popen([sys.executable, '-c', {other_code!r}])\n"
+        "time.sleep(60)\n",
+    ])
+    time.sleep(3)  # let the children start and touch their pages
+    return root
+
+
+def _kill_tree(root):
+    import os, signal
+    from harbor_singularity_hpc.environment import _descendant_pids
+    for pid in _descendant_pids(root.pid):
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    root.kill()
+    root.wait()
+
+
+@_needs_proc
+def test_oom_victim_is_largest_non_harness_process():
+    root = _spawn_tree(big_is_server=False)
+    try:
+        victim, victim_bytes, total = _oom_victim(root.pid)
+        assert victim is not None
+        assert b"server.py" not in Path(f"/proc/{victim}/cmdline").read_bytes()
+        assert victim_bytes > 250 * 1024 * 1024
+        assert total >= victim_bytes
+    finally:
+        _kill_tree(root)
+
+
+@_needs_proc
+def test_oom_victim_none_when_harness_is_the_hog():
+    root = _spawn_tree(big_is_server=True)
+    try:
+        victim, victim_bytes, _ = _oom_victim(root.pid)
+        assert victim is None                 # fall back to killing the container
+        assert victim_bytes > 250 * 1024 * 1024
+    finally:
+        _kill_tree(root)
+
+
+def test_oom_victim_unknown_root():
+    assert _oom_victim(2**22 + 12345)[0] is None
