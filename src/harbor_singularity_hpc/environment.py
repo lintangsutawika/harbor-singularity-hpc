@@ -123,14 +123,27 @@ def _rewrite_singularity_argv(argv: list) -> list:
     ):
         return argv
 
-    registry = SingularityWritableEnvironment._WRITABLE_REGISTRY
-    sandbox: Path | None = None
-    image_index: int | None = None
+    # Resolve the per-trial sandbox from the argv's session-marker bind
+    # ``-B <marker_host>:/opt/.hb_session_<session_id>`` (injected by
+    # _start_server) rather than the sif path: the sif is SHARED across
+    # concurrent trials of a repo, but the session is per-trial, so keying on
+    # it gives each exec its OWN isolated writable sandbox with no registry
+    # overwrite race.
+    session: str | None = None
+    image_index = None
     for i, token in enumerate(argv):
-        if str(token) in registry:
-            sandbox = registry[str(token)]
+        if token == "-B" or token == "--bind":
+            if i + 1 < len(argv):
+                spec = str(argv[i + 1])
+                if "/opt/.hb_session_" in spec:
+                    session = spec.split(":", 1)[1].split("/")[-1]
+            continue
+        if str(token).endswith(".sif") and image_index is None:
             image_index = i
-            break
+    if session is None:
+        return argv
+    registry = SingularityWritableEnvironment._WRITABLE_REGISTRY
+    sandbox = registry.get(session)
     if sandbox is None or image_index is None:
         return argv
 
@@ -598,58 +611,78 @@ class SingularityWritableEnvironment(SingularityEnvironment):
         return Path(tempfile.gettempdir())
 
     async def _build_writable_sandbox(self, sif_path: Path) -> Path:
-        """Extract ``sif_path`` into a SHARED, lock-guarded writable sandbox.
+        """Extract ``sif_path`` into a PER-TRIAL writable sandbox (isolated).
 
-        The sandbox is keyed by the sif path (content), NOT the session, so every
-        trial/task using the same (possibly derived) sif reuses ONE sandbox. A
-        file lock serializes concurrent builders of the same sif: the first trial
-        builds it under the lock, the rest wait and then reuse it. This replaces
-        the previous per-session sandbox, whose registration under a shared
-        ``sif_path`` registry key raced under N_CONCURRENT (last-write-wins
-        overwrite -> a trial's ``singularity exec`` rewrote to another trial's
-        sandbox or a stale entry -> read-only ``--writable-tmpfs`` -> the repo
-        bind silently missing -> ``Unknown agent type``).
-
-        Tradeoff: concurrent trials of the SAME repo share one writable rootfs,
-        so their ``/testbed`` edits can collide. That is bounded (SWE-bench
-        concurrent trials of a repo are distinct issue instances) and far better
-        than silently dropping ~7% of trials to a missing bind.
-
-        ``--fix-perms`` gives the owner rwX on every entry so the tree is
-        removable later. ``singularity build --sandbox`` extracts (no FUSE
-        mount), so it is unaffected by a missing ``user_allow_other``."""
+        Build a shared BASE sandbox per sif once (content-hashed, lock-guarded),
+        then reflink-copy it into a per-trial sandbox named by ``session_id``.
+        ``cp --reflink=auto`` is a copy-on-write clone on supporting filesystems
+        (XFS under node-local scratch), so the per-trial sandbox is cheap and each
+        trial gets its OWN writable rootfs -- no shared ``/testbed`` edits leak
+        between concurrent trials of the same repo. This supersedes both the
+        original per-session registration (whose sif-keyed registry raced) and the
+        intermediate shared-per-sif sandbox (whose shared writable rootfs risked
+        cross-trial contamination).
+        """
         root = self._sandbox_root()
         root.mkdir(parents=True, exist_ok=True)
-        # Stable per-sif name (content-hashed) so concurrent trials of the same
-        # sif resolve to the same sandbox; distinct sifs get distinct sandboxes.
         sif_key = hashlib.sha256(str(sif_path).encode("utf-8")).hexdigest()[:16]
-        sandbox = root / f"hbsbx_{sif_key}"
-        lock_path = root / f"hbsbx_{sif_key}.lock"
+        base = root / f"hbsbx_base_{sif_key}"
+        # The rewriter must map an exec argv back to this trial's sandbox. It reads
+        # a session marker the environment injects as a bind target
+        # ``/opt/.hb_session_<session_id>`` (see _start_server). Use that token here
+        # so the sandbox name and the argv marker agree.
+        trial = root / f"hbsbx_{sif_key}_{self._trial_marker()}"
+        if trial.exists():
+            return trial
+
+        # Build the base once per sif, serialized by a lock; concurrent builders wait.
+        lock_path = root / f"hbsbx_base_{sif_key}.lock"
         lock_fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR)
         try:
-            # Serialize the build per sif: one trial builds, the rest reuse.
             await asyncio.to_thread(fcntl.flock, lock_fd, fcntl.LOCK_EX)
-            if not sandbox.exists():
+            if not base.exists():
                 self.logger.info(
-                    f"Building shared writable sandbox {sandbox} from {sif_path}"
+                    f"Building base writable sandbox {base} from {sif_path}"
                 )
-                cmd = ["singularity", "build", "--fix-perms", "--sandbox", str(sandbox), str(sif_path)]
+                cmd = ["singularity", "build", "--fix-perms", "--sandbox", str(base), str(sif_path)]
                 process = await asyncio.create_subprocess_exec(
-                    *cmd,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
+                    *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
                 )
                 _, stderr = await process.communicate()
                 if process.returncode != 0:
                     raise RuntimeError(
-                        f"Failed to build writable sandbox from {sif_path}: "
+                        f"Failed to build base sandbox from {sif_path}: "
                         f"{stderr.decode(errors='replace')}"
                     )
         finally:
             await asyncio.to_thread(fcntl.flock, lock_fd, fcntl.LOCK_UN)
             os.close(lock_fd)
-        return sandbox
 
+        # CoW-clone the base into this trial's private sandbox.
+        if not trial.exists():
+            self.logger.debug(f"Reflink-cloning {base} -> {trial}")
+            clone = await asyncio.create_subprocess_exec(
+                "cp", "--reflink=auto", "-a", str(base), str(trial),
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            )
+            _, cerr = await clone.communicate()
+            if clone.returncode != 0:
+                # Fallback: plain recursive copy (slower, still isolated).
+                self.logger.warning(f"reflink failed ({cerr.decode(errors='replace')}); plain copy")
+                clone2 = await asyncio.create_subprocess_exec(
+                    "cp", "-a", str(base), str(trial),
+                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                )
+                _, cerr2 = await clone2.communicate()
+                if clone2.returncode != 0:
+                    raise RuntimeError(
+                        f"Failed to clone sandbox {base} -> {trial}: {cerr2.decode(errors='replace')}"
+                    )
+        return trial
+
+    def _trial_marker(self) -> str:
+        """Per-trial token repeated in both the sandbox name and the argv binder."""
+        return self.session_id
     async def _remove_sandbox(self, sandbox: Path | None) -> None:
         """Best-effort removal of a sandbox dir. Node-local scratch is job-scoped
         and reclaimed at job end, so leftovers are not fatal."""
@@ -776,12 +809,34 @@ class SingularityWritableEnvironment(SingularityEnvironment):
         # sif and sandbox THAT, so singularity honors RUN/COPY/ENV like Modal/Docker.
         if self._sif_path is not None and self._dockerfile_path.exists():
             self._sif_path = await self._ensure_dockerfile_derived_sif(self._sif_path)
-        # Build the writable sandbox from the (possibly derived) sif and register
-        # it so _rewrite_singularity_argv redirects the exec harbor launches.
-        # harbor's stock start() assigns self._sif_path before calling us.
+        # Build the writable sandbox (per-trial, isolated) and register it keyed by
+        # session_id (not the sif path — which is shared across concurrent trials of
+        # a repo and would collide). Every exec for THIS trial carries a marker bind
+        # ``-B <marker>:/opt/.hb_session_<session_id>`` (below), which the rewriter
+        # uses to route the exec to this trial's sandbox. harbor's stock start()
+        # assigns self._sif_path before calling us.
         if self._writable_sandbox and self._sandbox_path is None and self._sif_path is not None:
             self._sandbox_path = await self._build_writable_sandbox(self._sif_path)
-            type(self)._WRITABLE_REGISTRY[str(self._sif_path)] = self._sandbox_path
+            type(self)._WRITABLE_REGISTRY[self._trial_marker()] = self._sandbox_path
+
+        # Inject a per-trial marker bind so the rewriter can identify this exec's
+        # sandbox from the argv (the sif is shared, the session is unique). The
+        # marker is a tiny per-trial file; super() turns self._mounts into
+        # ``-B <marker>:/opt/.hb_session_<session_id>`` in the singularity argv.
+        marker = self._sandbox_root() / f".hb_session_{self._trial_marker()}"
+        try:
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            marker.write_text(self._trial_marker())
+        except OSError:
+            pass
+        if marker.exists() and self._mounts is None:
+            self._mounts = []
+        if marker.exists():
+            self._mounts.append({
+                "type": "bind",
+                "source": str(marker),
+                "target": f"/opt/.hb_session_{self._trial_marker()}",
+            })
 
         await super()._start_server()
 
@@ -868,11 +923,10 @@ class SingularityWritableEnvironment(SingularityEnvironment):
                     pass
 
             if self._sandbox_path is not None:
-                if self._sif_path is not None:
-                    type(self)._WRITABLE_REGISTRY.pop(str(self._sif_path), None)
-                # Shared per-sif sandboxes are NOT removed per trial: a concurrent
-                # trial of the same sif may still be using this exact directory.
-                # They live under node-local job-scoped scratch and are reclaimed
-                # at job end (see _sandbox_root / the comment on _remove_sandbox).
-                # Pre-shared-sandbox (per-session) builds are removed as before.
+                # Pop the per-trial entry (keyed by session marker) so a NEW trial
+                # reusing a stale registry slot can't route to a dead sandbox.
+                type(self)._WRITABLE_REGISTRY.pop(self._trial_marker(), None)
+                # Remove this trial's PRIVATE sandbox (per-trial copy). The base
+                # per-sif sandbox is left for job-end node-local reclamation.
+                await self._remove_sandbox(self._sandbox_path)
                 self._sandbox_path = None

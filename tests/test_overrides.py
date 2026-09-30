@@ -504,3 +504,44 @@ def test_build_writable_sandbox_is_shared_per_sif(monkeypatch, tmp_path):
     assert c != a, "distinct sif must get a distinct sandbox"
     # teardown must NOT remove the shared sandbox (another trial may use it)
     monkeypatch.setattr(asyncio, "create_subprocess_exec", real_exec)
+
+
+def test_build_writable_sandbox_is_per_trial_isolated(monkeypatch, tmp_path):
+    """Per-trial isolation: same sif, different sessions -> different sandboxes.
+
+    Regression for the shared-per-sif design: concurrent trials of the same repo
+    must NOT share one writable rootfs (their /testbed edits could contaminate each
+    other). Each trial gets its own reflink-cloned sandbox, keyed by session.
+    """
+    from harbor_singularity_hpc.environment import SingularityWritableEnvironment
+
+    async def _fake_build(*argv, **kwargs):
+        if argv[0] == "singularity":
+            dst = argv[argv.index("--sandbox") + 1]
+            (Path(dst)).mkdir(parents=True, exist_ok=True)
+        elif argv[0] == "cp":
+            (Path(argv[-1])).mkdir(parents=True, exist_ok=True)
+        async def _comm():
+            return (b"", b"")
+        return SimpleNamespace(returncode=0, communicate=_comm)
+
+    real_exec = asyncio.create_subprocess_exec
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_build)
+    monkeypatch.setattr(SingularityWritableEnvironment, "_sandbox_root",
+                        lambda self: tmp_path)
+
+    async def go():
+        ea = object.__new__(SingularityWritableEnvironment)
+        ea.logger = None; ea.session_id = "trial_A"; ea._mounts = []; ea._sandbox_path = None
+        eb = object.__new__(SingularityWritableEnvironment)
+        eb.logger = None; eb.session_id = "trial_B"; eb._mounts = []; eb._sandbox_path = None
+        sif = tmp_path / "df_shared.sif"; sif.write_bytes(b"sif")
+        a = await ea._build_writable_sandbox(sif)
+        b = await eb._build_writable_sandbox(sif)
+        return a, b
+
+    a, b = asyncio.run(go())
+    assert a != b, f"per-trial isolation violated: {a} == {b}"
+    assert a.name.startswith("hbsbx_") and b.name.startswith("hbsbx_")
+    assert "trial_A" in a.name and "trial_B" in b.name
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", real_exec)
