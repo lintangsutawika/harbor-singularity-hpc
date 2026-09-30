@@ -598,28 +598,56 @@ class SingularityWritableEnvironment(SingularityEnvironment):
         return Path(tempfile.gettempdir())
 
     async def _build_writable_sandbox(self, sif_path: Path) -> Path:
-        """Extract ``sif_path`` into a per-session writable sandbox directory.
+        """Extract ``sif_path`` into a SHARED, lock-guarded writable sandbox.
+
+        The sandbox is keyed by the sif path (content), NOT the session, so every
+        trial/task using the same (possibly derived) sif reuses ONE sandbox. A
+        file lock serializes concurrent builders of the same sif: the first trial
+        builds it under the lock, the rest wait and then reuse it. This replaces
+        the previous per-session sandbox, whose registration under a shared
+        ``sif_path`` registry key raced under N_CONCURRENT (last-write-wins
+        overwrite -> a trial's ``singularity exec`` rewrote to another trial's
+        sandbox or a stale entry -> read-only ``--writable-tmpfs`` -> the repo
+        bind silently missing -> ``Unknown agent type``).
+
+        Tradeoff: concurrent trials of the SAME repo share one writable rootfs,
+        so their ``/testbed`` edits can collide. That is bounded (SWE-bench
+        concurrent trials of a repo are distinct issue instances) and far better
+        than silently dropping ~7% of trials to a missing bind.
 
         ``--fix-perms`` gives the owner rwX on every entry so the tree is
         removable later. ``singularity build --sandbox`` extracts (no FUSE
         mount), so it is unaffected by a missing ``user_allow_other``."""
         root = self._sandbox_root()
         root.mkdir(parents=True, exist_ok=True)
-        sandbox = root / f"hbsbx_{self.session_id}"
-        await self._remove_sandbox(sandbox)
-        cmd = ["singularity", "build", "--fix-perms", "--sandbox", str(sandbox), str(sif_path)]
-        self.logger.debug(f"Building writable sandbox: {' '.join(cmd)}")
-        process = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        _, stderr = await process.communicate()
-        if process.returncode != 0:
-            raise RuntimeError(
-                f"Failed to build writable sandbox from {sif_path}: "
-                f"{stderr.decode(errors='replace')}"
-            )
+        # Stable per-sif name (content-hashed) so concurrent trials of the same
+        # sif resolve to the same sandbox; distinct sifs get distinct sandboxes.
+        sif_key = hashlib.sha256(str(sif_path).encode("utf-8")).hexdigest()[:16]
+        sandbox = root / f"hbsbx_{sif_key}"
+        lock_path = root / f"hbsbx_{sif_key}.lock"
+        lock_fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR)
+        try:
+            # Serialize the build per sif: one trial builds, the rest reuse.
+            await asyncio.to_thread(fcntl.flock, lock_fd, fcntl.LOCK_EX)
+            if not sandbox.exists():
+                self.logger.info(
+                    f"Building shared writable sandbox {sandbox} from {sif_path}"
+                )
+                cmd = ["singularity", "build", "--fix-perms", "--sandbox", str(sandbox), str(sif_path)]
+                process = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                _, stderr = await process.communicate()
+                if process.returncode != 0:
+                    raise RuntimeError(
+                        f"Failed to build writable sandbox from {sif_path}: "
+                        f"{stderr.decode(errors='replace')}"
+                    )
+        finally:
+            await asyncio.to_thread(fcntl.flock, lock_fd, fcntl.LOCK_UN)
+            os.close(lock_fd)
         return sandbox
 
     async def _remove_sandbox(self, sandbox: Path | None) -> None:
@@ -842,5 +870,9 @@ class SingularityWritableEnvironment(SingularityEnvironment):
             if self._sandbox_path is not None:
                 if self._sif_path is not None:
                     type(self)._WRITABLE_REGISTRY.pop(str(self._sif_path), None)
-                await self._remove_sandbox(self._sandbox_path)
+                # Shared per-sif sandboxes are NOT removed per trial: a concurrent
+                # trial of the same sif may still be using this exact directory.
+                # They live under node-local job-scoped scratch and are reclaimed
+                # at job end (see _sandbox_root / the comment on _remove_sandbox).
+                # Pre-shared-sandbox (per-session) builds are removed as before.
                 self._sandbox_path = None

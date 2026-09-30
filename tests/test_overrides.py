@@ -13,6 +13,8 @@ Two kinds:
 
 import asyncio
 import inspect
+from types import SimpleNamespace
+
 from pathlib import Path
 
 import pytest
@@ -452,3 +454,53 @@ def test_oom_victim_none_when_harness_is_the_hog():
 
 def test_oom_victim_unknown_root():
     assert _oom_victim(2**22 + 12345)[0] is None
+
+
+
+async def _fake_build(*argv, **kwargs):
+    """Emulate `singularity build --sandbox <dst> <sif>`: create dst, return rc=0."""
+    dst = argv[argv.index("--sandbox") + 1]
+    (Path(dst)).mkdir(parents=True, exist_ok=True)
+    async def _comm():
+        return (b"", b"")
+    proc = SimpleNamespace(returncode=0, communicate=_comm)
+    return proc
+
+
+def test_build_writable_sandbox_is_shared_per_sif(monkeypatch, tmp_path):
+    """Regression: concurrent trials of the SAME (possibly derived) sif must reuse
+    ONE shared writable sandbox, not race per-session registrations.
+
+    Previously the sandbox was keyed by session while the registry entry was keyed
+    by the (shared) sif path -> under N_CONCURRENT, concurrent trials of a
+    Dockerfile-bearing repo overwrote each other's sif->sandbox entry and a trial's
+    exec could resolve to another's sandbox or a stale entry, falling back to
+    read-only --writable-tmpfs (repo bind missing -> "Unknown agent type").
+    """
+    from harbor_singularity_hpc.environment import SingularityWritableEnvironment
+
+    real_exec = asyncio.create_subprocess_exec
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_build)
+    # isolate sandbox root under the test tmp, not node scratch
+    monkeypatch.setattr(
+        SingularityWritableEnvironment, "_sandbox_root", lambda self: tmp_path
+    )
+
+    env = object.__new__(SingularityWritableEnvironment)
+    env.session_id = "trial_A"
+    env._image_cache_dir = tmp_path
+
+    async def go():
+        p = tmp_path / "df_shared.sif"
+        p.write_bytes(b"sif")
+        a = await env._build_writable_sandbox(p)
+        b = await env._build_writable_sandbox(p)  # same sif again
+        c = await env._build_writable_sandbox(tmp_path / "other.sif")  # distinct
+        return a, b, c
+
+    a, b, c = asyncio.run(go())
+    assert a == b, f"same sif must share one sandbox: {a} vs {b}"
+    assert a.name.startswith("hbsbx_"), a.name
+    assert c != a, "distinct sif must get a distinct sandbox"
+    # teardown must NOT remove the shared sandbox (another trial may use it)
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", real_exec)
