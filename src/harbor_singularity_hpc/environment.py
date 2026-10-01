@@ -824,10 +824,14 @@ class SingularityWritableEnvironment(SingularityEnvironment):
         # sandbox from the argv (the sif is shared, the session is unique). The
         # marker is a tiny per-trial file; super() turns self._mounts into
         # ``-B <marker>:/opt/.hb_session_<session_id>`` in the singularity argv.
+        # The marker must be a DIRECTORY: singularity `-B <host>:/opt/.hb_session_<id>`
+        # binds host->container dirs, and a plain file mount onto a non-existent
+        # target errors ("not a directory"). The session id lives in the directory
+        # NAME (.hb_session_<id>), which the rewriter reads from the target path.
         marker = self._sandbox_root() / f".hb_session_{self._trial_marker()}"
         try:
             marker.parent.mkdir(parents=True, exist_ok=True)
-            marker.write_text(self._trial_marker())
+            marker.mkdir(parents=True, exist_ok=True)
         except OSError:
             pass
         if marker.exists() and self._mounts is None:
