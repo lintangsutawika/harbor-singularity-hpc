@@ -110,6 +110,21 @@ def _install_argv_rewrite() -> None:
     asyncio.create_subprocess_exec = _wrapped  # type: ignore[assignment]
 
 
+def _ensure_mount_directory(path: Path) -> None:
+    """Create only missing mount parents with traversable permissions.
+
+    Harness umask may be 077. Existing image permissions must remain intact.
+    """
+    missing = []
+    current = path
+    while not current.exists():
+        missing.append(current)
+        current = current.parent
+    for directory in reversed(missing):
+        directory.mkdir(exist_ok=True)
+        directory.chmod(0o755)
+
+
 def _rewrite_singularity_argv(argv: list) -> list:
     """Rewrite a ``singularity exec --writable-tmpfs <registered-sif>`` argv to
     use ``--writable <sandbox>``, pre-creating every ``-B`` destination and the
@@ -162,11 +177,11 @@ def _rewrite_singularity_argv(argv: list) -> list:
         if dst.startswith("/"):
             target = Path(sandbox) / dst.lstrip("/")
             if is_file:
-                target.parent.mkdir(parents=True, exist_ok=True)
+                _ensure_mount_directory(target.parent)
                 if not target.exists():
                     target.touch()
             else:
-                target.mkdir(parents=True, exist_ok=True)
+                _ensure_mount_directory(target)
 
     new = list(argv)
     new[new.index("--writable-tmpfs")] = "--writable"
@@ -193,7 +208,7 @@ def _rewrite_singularity_argv(argv: list) -> list:
         )
         if not already and os.path.exists(hostpath):
             target = Path(sandbox) / hostpath.lstrip("/")
-            target.parent.mkdir(parents=True, exist_ok=True)
+            _ensure_mount_directory(target.parent)
             if not target.exists():
                 target.touch()
             new[2:2] = ["--bind", hostpath]
@@ -642,7 +657,7 @@ class SingularityWritableEnvironment(SingularityEnvironment):
         """
         root = self._sandbox_root()
         root.mkdir(parents=True, exist_ok=True)
-        sif_key = hashlib.sha256(str(sif_path).encode("utf-8")).hexdigest()[:16]
+        sif_key = hashlib.sha256(("preserve-owners-v2:" + str(sif_path)).encode("utf-8")).hexdigest()[:16]
         base = root / f"hbsbx_base_{sif_key}"
         # The rewriter must map an exec argv back to this trial's sandbox. It reads
         # a session marker the environment injects as a bind target
@@ -661,7 +676,7 @@ class SingularityWritableEnvironment(SingularityEnvironment):
                 self.logger.info(
                     f"Building base writable sandbox {base} from {sif_path}"
                 )
-                cmd = ["singularity", "build", "--fix-perms", "--sandbox", str(base), str(sif_path)]
+                cmd = ["singularity", "build", "--fakeroot", "--sandbox", str(base), str(sif_path)]
                 process = await asyncio.create_subprocess_exec(
                     *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
                 )
@@ -675,26 +690,26 @@ class SingularityWritableEnvironment(SingularityEnvironment):
             await asyncio.to_thread(fcntl.flock, lock_fd, fcntl.LOCK_UN)
             os.close(lock_fd)
 
-        # CoW-clone the base into this trial's private sandbox.
+        # Extracting or cloning as the host user loses image UIDs and makes
+        # private learner-owned workspaces unreadable after su. Both operations
+        # must run in the same fakeroot UID mapping used by the task runtime.
         if not trial.exists():
-            self.logger.debug(f"Reflink-cloning {base} -> {trial}")
+            self.logger.debug(f"Reflink-cloning {base} -> {trial} with image ownership")
             clone = await asyncio.create_subprocess_exec(
-                "cp", "--reflink=auto", "-a", str(base), str(trial),
+                "singularity", "exec", "--fakeroot", "--containall",
+                "--no-mount", "home,tmp,bind-paths", "--pwd", "/",
+                "--bind", f"{root}:/mnt/harbor-sandboxes",
+                str(base), "cp", "--reflink=auto", "-a",
+                f"/mnt/harbor-sandboxes/{base.name}",
+                f"/mnt/harbor-sandboxes/{trial.name}",
                 stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
             )
-            _, cerr = await clone.communicate()
+            _, stderr = await clone.communicate()
             if clone.returncode != 0:
-                # Fallback: plain recursive copy (slower, still isolated).
-                self.logger.warning(f"reflink failed ({cerr.decode(errors='replace')}); plain copy")
-                clone2 = await asyncio.create_subprocess_exec(
-                    "cp", "-a", str(base), str(trial),
-                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                raise RuntimeError(
+                    f"Failed to clone sandbox preserving image ownership {base} -> {trial}: "
+                    f"{stderr.decode(errors='replace')}"
                 )
-                _, cerr2 = await clone2.communicate()
-                if clone2.returncode != 0:
-                    raise RuntimeError(
-                        f"Failed to clone sandbox {base} -> {trial}: {cerr2.decode(errors='replace')}"
-                    )
         return trial
 
     def _trial_marker(self) -> str:

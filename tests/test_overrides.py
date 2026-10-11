@@ -480,7 +480,7 @@ def test_oom_victim_unknown_root():
 
 async def _fake_build(*argv, **kwargs):
     """Emulate `singularity build --sandbox <dst> <sif>`: create dst, return rc=0."""
-    dst = argv[argv.index("--sandbox") + 1] if argv[0] == "singularity" else argv[-1]
+    dst = argv[argv.index("--sandbox") + 1] if "--sandbox" in argv else str(Path(argv[argv.index("--bind") + 1].split(":", 1)[0]) / Path(argv[-1]).name)
     (Path(dst)).mkdir(parents=True, exist_ok=True)
     async def _comm():
         return (b"", b"")
@@ -538,11 +538,14 @@ def test_build_writable_sandbox_is_per_trial_isolated(monkeypatch, tmp_path):
     from harbor_singularity_hpc.environment import SingularityWritableEnvironment
 
     async def _fake_build(*argv, **kwargs):
-        if argv[0] == "singularity":
+        if "--sandbox" in argv:
+            assert "--fakeroot" in argv
             dst = argv[argv.index("--sandbox") + 1]
             (Path(dst)).mkdir(parents=True, exist_ok=True)
-        elif argv[0] == "cp":
-            (Path(argv[-1])).mkdir(parents=True, exist_ok=True)
+        elif "cp" in argv:
+            assert "--fakeroot" in argv and "-a" in argv
+            root = Path(argv[argv.index("--bind") + 1].split(":", 1)[0])
+            (root / Path(argv[-1]).name).mkdir(parents=True, exist_ok=True)
         async def _comm():
             return (b"", b"")
         return SimpleNamespace(returncode=0, communicate=_comm)
@@ -567,3 +570,18 @@ def test_build_writable_sandbox_is_per_trial_isolated(monkeypatch, tmp_path):
     assert a.name.startswith("hbsbx_") and b.name.startswith("hbsbx_")
     assert "trial_A" in a.name and "trial_B" in b.name
     monkeypatch.setattr(asyncio, "create_subprocess_exec", real_exec)
+
+
+def test_new_mount_parents_are_traversable_under_private_umask(tmp_path):
+    from harbor_singularity_hpc.environment import _ensure_mount_directory
+    import os
+    old_umask = os.umask(0o077)
+    try:
+        private = tmp_path / "private"
+        private.mkdir(mode=0o700)
+        _ensure_mount_directory(private / "logs" / "agent")
+        assert private.stat().st_mode & 0o777 == 0o700
+        assert (private / "logs").stat().st_mode & 0o777 == 0o755
+        assert (private / "logs" / "agent").stat().st_mode & 0o777 == 0o755
+    finally:
+        os.umask(old_umask)
