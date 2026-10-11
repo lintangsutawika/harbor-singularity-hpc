@@ -676,16 +676,23 @@ class SingularityWritableEnvironment(SingularityEnvironment):
                 self.logger.info(
                     f"Building base writable sandbox {base} from {sif_path}"
                 )
-                cmd = ["singularity", "build", "--fakeroot", "--sandbox", str(base), str(sif_path)]
-                process = await asyncio.create_subprocess_exec(
-                    *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
-                )
-                _, stderr = await process.communicate()
-                if process.returncode != 0:
-                    raise RuntimeError(
-                        f"Failed to build base sandbox from {sif_path}: "
-                        f"{stderr.decode(errors='replace')}"
+                # Entering fakeroot cannot read private NFS paths under root
+                # squashing. Stage the input as the owning host user first.
+                local_sif = root / f"hbsbx_extract_{sif_key}.sif"
+                try:
+                    await asyncio.to_thread(shutil.copyfile, sif_path, local_sif)
+                    cmd = ["singularity", "build", "--fakeroot", "--sandbox", str(base), str(local_sif)]
+                    process = await asyncio.create_subprocess_exec(
+                        *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
                     )
+                    _, stderr = await process.communicate()
+                    if process.returncode != 0:
+                        raise RuntimeError(
+                            f"Failed to build base sandbox from {sif_path}: "
+                            f"{stderr.decode(errors='replace')}"
+                        )
+                finally:
+                    local_sif.unlink(missing_ok=True)
         finally:
             await asyncio.to_thread(fcntl.flock, lock_fd, fcntl.LOCK_UN)
             os.close(lock_fd)
@@ -695,21 +702,33 @@ class SingularityWritableEnvironment(SingularityEnvironment):
         # must run in the same fakeroot UID mapping used by the task runtime.
         if not trial.exists():
             self.logger.debug(f"Reflink-cloning {base} -> {trial} with image ownership")
-            clone = await asyncio.create_subprocess_exec(
+            _ensure_mount_directory(base / "mnt/harbor-sandboxes")
+            prefix = [
                 "singularity", "exec", "--fakeroot", "--containall",
                 "--no-mount", "home,tmp,bind-paths", "--pwd", "/",
-                "--bind", f"{root}:/mnt/harbor-sandboxes",
-                str(base), "cp", "--reflink=auto", "-a",
-                f"/mnt/harbor-sandboxes/{base.name}",
-                f"/mnt/harbor-sandboxes/{trial.name}",
+                "--bind", f"{root}:/mnt/harbor-sandboxes", str(base),
+            ]
+            source = f"/mnt/harbor-sandboxes/{base.name}"
+            target = f"/mnt/harbor-sandboxes/{trial.name}"
+            clone = await asyncio.create_subprocess_exec(
+                *prefix, "cp", "--reflink=auto", "-a", source, target,
                 stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
             )
             _, stderr = await clone.communicate()
             if clone.returncode != 0:
-                raise RuntimeError(
-                    f"Failed to clone sandbox preserving image ownership {base} -> {trial}: "
-                    f"{stderr.decode(errors='replace')}"
+                # BusyBox cp lacks --reflink. Keep the same UID mapping for the
+                # fallback; a host-user cp would silently lose image ownership.
+                fallback = await asyncio.create_subprocess_exec(
+                    *prefix, "sh", "-c",
+                    f"rm -rf -- {shlex.quote(target)} && cp -a {shlex.quote(source)} {shlex.quote(target)}",
+                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
                 )
+                _, stderr = await fallback.communicate()
+                if fallback.returncode != 0:
+                    raise RuntimeError(
+                        f"Failed to clone sandbox preserving image ownership {base} -> {trial}: "
+                        f"{stderr.decode(errors='replace')}"
+                    )
         return trial
 
     def _trial_marker(self) -> str:
@@ -720,15 +739,28 @@ class SingularityWritableEnvironment(SingularityEnvironment):
         and reclaimed at job end, so leftovers are not fatal."""
         if not sandbox or not sandbox.exists():
             return
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                "chmod", "-R", "u+rwX", str(sandbox),
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL,
-            )
-            await proc.wait()
-        except Exception:
-            pass
+        # Private task-user files carry subordinate host UIDs. Remove them in
+        # that same mapping; host-user chmod/rmtree cannot traverse these files.
+        if sandbox.parent != self._sandbox_root() or not sandbox.name.startswith("hbsbx_"):
+            self.logger.warning("Refusing to remove a sandbox outside the owned cache")
+            return
+        key = sandbox.name.split("_", 2)[1]
+        base = sandbox.parent / f"hbsbx_base_{key}"
+        if base.exists():
+            try:
+                target = f"/mnt/harbor-sandboxes/{sandbox.name}"
+                proc = await asyncio.create_subprocess_exec(
+                    "singularity", "exec", "--fakeroot", "--containall",
+                    "--no-mount", "home,tmp,bind-paths", "--pwd", "/",
+                    "--bind", f"{sandbox.parent}:/mnt/harbor-sandboxes", str(base),
+                    "sh", "-c", f"chmod -R u+rwX {shlex.quote(target)} && rm -rf -- {shlex.quote(target)}",
+                    stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+                )
+                await proc.wait()
+                if proc.returncode == 0:
+                    return
+            except Exception:
+                self.logger.warning("Mapped sandbox cleanup failed; job-end cleanup remains available")
         shutil.rmtree(sandbox, ignore_errors=True)
 
     # -- pull retry + semaphore -------------------------------------------

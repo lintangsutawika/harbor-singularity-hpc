@@ -517,7 +517,9 @@ def test_build_writable_sandbox_is_shared_per_sif(monkeypatch, tmp_path):
         p.write_bytes(b"sif")
         a = await env._build_writable_sandbox(p)
         b = await env._build_writable_sandbox(p)  # same sif again
-        c = await env._build_writable_sandbox(tmp_path / "other.sif")  # distinct
+        other = tmp_path / "other.sif"
+        other.write_bytes(b"other sif")
+        c = await env._build_writable_sandbox(other)  # distinct
         return a, b, c
 
     a, b, c = asyncio.run(go())
