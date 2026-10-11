@@ -606,3 +606,16 @@ def test_private_image_workdir_does_not_require_host_user_access(tmp_path, monke
         assert (sandbox / "staging").is_dir()
     finally:
         module.SingularityWritableEnvironment._WRITABLE_REGISTRY.pop("session", None)
+
+
+def test_copy_cache_changes_when_source_permissions_change(tmp_path):
+    from harbor_singularity_hpc.environment import _path_digest
+    root = tmp_path / "source"
+    root.mkdir(mode=0o700)
+    (root / "module.py").write_text("unchanged code")
+    before = _path_digest(root)
+    root.chmod(0o755)
+    assert _path_digest(root) != before
+    before = _path_digest(root)
+    (root / "empty-directory").mkdir()
+    assert _path_digest(root) != before

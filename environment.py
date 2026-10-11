@@ -420,12 +420,16 @@ def _dockerfile_layers(dockerfile: Path, build_context: Path | None = None) -> l
 
 
 def _path_digest(path: Path) -> str:
-    """Content digest of a COPY source (file, or every file under a dir)."""
+    """Digest COPY contents, directory topology and Unix permission bits."""
     h = hashlib.sha256()
-    paths = sorted(p for p in path.rglob("*") if p.is_file()) if path.is_dir() else [path]
+    paths = [path, *sorted(path.rglob("*"))] if path.is_dir() else [path]
     for p in paths:
         h.update(str(p.relative_to(path) if path.is_dir() else p.name).encode())
-        h.update(p.read_bytes())
+        h.update(b"\0" + str(p.stat().st_mode & 0o7777).encode() + b"\0")
+        if p.is_file():
+            with p.open("rb") as stream:
+                for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                    h.update(chunk)
     return h.hexdigest()
 
 
