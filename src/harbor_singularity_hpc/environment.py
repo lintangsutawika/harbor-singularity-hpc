@@ -149,17 +149,24 @@ def _rewrite_singularity_argv(argv: list) -> list:
         return argv
 
     # Pre-create the bind destinations and workdir inside the sandbox.
-    dests: list[str] = []
+    dests: list[tuple[str, bool]] = []
     for i, token in enumerate(argv):
         if token == "-B" and i + 1 < len(argv):
             spec = str(argv[i + 1])
             dst = spec.split(":", 1)[1] if ":" in spec else spec
-            dests.append(dst.split(":", 1)[0])  # drop any :ro/:rw option
+            source = Path(spec.split(":", 1)[0])
+            dests.append((dst.split(":", 1)[0], source.is_file() or source.is_char_device()))
         elif token == "--pwd" and i + 1 < len(argv):
-            dests.append(str(argv[i + 1]))
-    for dst in dests:
+            dests.append((str(argv[i + 1]), False))
+    for dst, is_file in dests:
         if dst.startswith("/"):
-            (Path(sandbox) / dst.lstrip("/")).mkdir(parents=True, exist_ok=True)
+            target = Path(sandbox) / dst.lstrip("/")
+            if is_file:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                if not target.exists():
+                    target.touch()
+            else:
+                target.mkdir(parents=True, exist_ok=True)
 
     new = list(argv)
     new[new.index("--writable-tmpfs")] = "--writable"
@@ -173,13 +180,22 @@ def _rewrite_singularity_argv(argv: list) -> list:
     # cannot reach PyPI. The network namespace is shared (no ``--net``), so binding
     # the host copies back in restores both. Idempotent: skip a path already bound
     # (harbor's argv, or a repeat call) or absent on the host.
-    for hostpath in ("/dev", "/etc/resolv.conf", "/etc/hosts"):
+    # Binding all of host /dev exposes unreserved GPUs and host devices. Restore
+    # only the basic character devices required by the contained process. GPU
+    # backends must bind each reserved numbered device explicitly.
+    hostpaths = ("/dev/null", "/dev/zero", "/dev/full", "/dev/random",
+                 "/dev/urandom", "/dev/tty", "/etc/resolv.conf", "/etc/hosts")
+    for hostpath in hostpaths:
         already = any(
             str(new[i]) in ("-B", "--bind") and i + 1 < len(new)
             and str(new[i + 1]).split(":", 1)[0] == hostpath
             for i in range(len(new))
         )
         if not already and os.path.exists(hostpath):
+            target = Path(sandbox) / hostpath.lstrip("/")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if not target.exists():
+                target.touch()
             new[2:2] = ["--bind", hostpath]
     return new
 
@@ -769,17 +785,37 @@ class SingularityWritableEnvironment(SingularityEnvironment):
     async def _build_derived_layer(self, base: Path, fragment: str, out: Path, label: str) -> None:
         def_path = out.with_suffix(".def")
         def_path.write_text(f"Bootstrap: localimage\nFrom: {base}\n\n{fragment}")
-        tmp_out = out.with_name(f"{out.name}.tmp-{os.getpid()}")
-        # Give %post a private /tmp: singularity otherwise binds the host's shared
-        # /tmp, where concurrent builds' staged scripts would collide.
-        # World-writable + sticky like a real /tmp: apt drops to its ``_apt`` user and
-        # fails every fetch ("Couldn't create temporary file") under mkdtemp's 0700.
-        build_tmp = Path(tempfile.mkdtemp(prefix="df_tmp_", dir=self._image_cache_dir))
+        # NFS root-squashing can deny fakeroot access to group/home paths.
+        # Stage build inputs and output locally, then publish with the host UID.
+        scratch_parent = os.environ.get("SINGULARITY_TMPDIR")
+        build_root = Path(tempfile.mkdtemp(prefix="harbor_layer_", dir=scratch_parent))
+        local_base = build_root / "base.sif"
+        shutil.copyfile(base, local_base)
+        rewritten = []
+        files_section = False
+        for line in fragment.splitlines():
+            if line.startswith("%"):
+                files_section = line.strip() == "%files"
+            elif files_section and line.strip():
+                source, destination = line.strip().rsplit(None, 1)
+                staged = build_root / f"input-{len(rewritten)}"
+                original = Path(source)
+                if original.is_dir():
+                    shutil.copytree(original, staged)
+                else:
+                    shutil.copy2(original, staged)
+                line = f"    {staged} {destination}"
+            rewritten.append(line)
+        local_def = build_root / "recipe.def"
+        local_def.write_text(f"Bootstrap: localimage\nFrom: {local_base}\n\n" + "\n".join(rewritten) + "\n")
+        tmp_out = build_root / "result.sif"
+        build_tmp = build_root / "tmp"
+        build_tmp.mkdir(mode=0o1777)
         build_tmp.chmod(0o1777)
         cmd = [
             "singularity", "build", "--fakeroot", "--force",
             "--bind", f"{build_tmp}:/tmp",
-            str(tmp_out), str(def_path),
+            str(tmp_out), str(local_def),
         ]
         self.logger.info(f"Building Dockerfile layer {label}: {' '.join(cmd)}")
         try:
@@ -798,18 +834,48 @@ class SingularityWritableEnvironment(SingularityEnvironment):
                     f"recipe {def_path}, log {log_path}. Output tail:\n"
                     f"{output.decode(errors='replace')[-4000:]}"
                 )
-            os.replace(tmp_out, out)
+            publication = out.with_name(f"{out.name}.tmp-{os.getpid()}")
+            try:
+                shutil.copyfile(tmp_out, publication)
+                os.replace(publication, out)
+            finally:
+                publication.unlink(missing_ok=True)
         finally:
-            tmp_out.unlink(missing_ok=True)
-            shutil.rmtree(build_tmp, ignore_errors=True)
+            shutil.rmtree(build_root, ignore_errors=True)
 
     # -- server launch (writable sandbox + exec timeout floor) ------------
+
+    async def _ensure_offline_server_sif(self, base: Path) -> Path:
+        if self._network_disabled:
+            # Provision the harness before entering the offline namespace.
+            # Keep dependencies isolated from the task's Python environment.
+            fragment = (
+                "%post\n"
+                "    set -eu\n"
+                "    apt-get update -qq\n"
+                "    apt-get install -y --no-install-recommends python3-venv\n"
+                "    /usr/bin/python3 -m venv /opt/harbor-server\n"
+                "    /opt/harbor-server/bin/python -m pip install 'fastapi==0.128.0' 'uvicorn==0.48.0'\n"
+            )
+            key = hashlib.sha256((str(base) + fragment).encode()).hexdigest()[:16]
+            derived = self._image_cache_dir / f"offline_server_{key}.sif"
+            lock = os.open(str(derived.with_suffix(".lock")), os.O_CREAT | os.O_RDWR)
+            try:
+                await asyncio.to_thread(fcntl.flock, lock, fcntl.LOCK_EX)
+                if not derived.exists():
+                    await self._build_derived_layer(base, fragment, derived, "offline server")
+            finally:
+                os.close(lock)
+            return derived
+        return base
 
     async def _start_server(self) -> None:
         # If the task Dockerfile adds dependency layers, bake them into a derived
         # sif and sandbox THAT, so singularity honors RUN/COPY/ENV like Modal/Docker.
         if self._sif_path is not None and self._dockerfile_path.exists():
             self._sif_path = await self._ensure_dockerfile_derived_sif(self._sif_path)
+        if self._sif_path is not None:
+            self._sif_path = await self._ensure_offline_server_sif(self._sif_path)
         # Build the writable sandbox (per-trial, isolated) and register it keyed by
         # session_id (not the sif path — which is shared across concurrent trials of
         # a repo and would collide). Every exec for THIS trial carries a marker bind

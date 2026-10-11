@@ -13,6 +13,7 @@ Two kinds:
 
 import asyncio
 import inspect
+import logging
 from types import SimpleNamespace
 
 from pathlib import Path
@@ -126,6 +127,7 @@ def _exec_argv(sif: str) -> list:
         "--fakeroot", "--containall", "--pid",
         "-B", "/tmp/staging:/staging",
         "-B", "/tmp/staging/env_files:/staging/env_files",
+        "-B", "/tmp/marker:/opt/.hb_session_session",
         sif,
         "bash", "-c", 'exec /staging/bootstrap.sh "$@"',
     ]
@@ -135,11 +137,11 @@ def test_rewrite_swaps_flag_and_image_and_creates_dests(tmp_path):
     sandbox = tmp_path / "sbx"
     sandbox.mkdir()
     sif = str(tmp_path / "img.sif")
-    SingularityWritableEnvironment._WRITABLE_REGISTRY[sif] = sandbox
+    SingularityWritableEnvironment._WRITABLE_REGISTRY["session"] = sandbox
     try:
         out = _rewrite_singularity_argv(_exec_argv(sif))
     finally:
-        SingularityWritableEnvironment._WRITABLE_REGISTRY.pop(sif, None)
+        SingularityWritableEnvironment._WRITABLE_REGISTRY.pop("session", None)
 
     assert "--writable" in out and "--writable-tmpfs" not in out
     assert str(sandbox) in out and sif not in out
@@ -148,20 +150,39 @@ def test_rewrite_swaps_flag_and_image_and_creates_dests(tmp_path):
         assert (sandbox / dst).is_dir(), f"{dst} not pre-created"
 
 
+def test_file_binds_keep_file_mountpoints_and_do_not_expose_all_host_devices(tmp_path):
+    sandbox = tmp_path / "sandbox"
+    sandbox.mkdir()
+    driver = tmp_path / "libcuda.so.1"
+    driver.write_bytes(b"driver")
+    argv = _exec_argv(str(tmp_path / "image.sif"))
+    argv[2:2] = ["-B", f"{driver}:/.singularity.d/libs/libcuda.so.1:ro"]
+    SingularityWritableEnvironment._WRITABLE_REGISTRY["session"] = sandbox
+    try:
+        result = _rewrite_singularity_argv(argv)
+    finally:
+        SingularityWritableEnvironment._WRITABLE_REGISTRY.pop("session", None)
+    assert (sandbox / ".singularity.d/libs/libcuda.so.1").is_file()
+    sources = [str(result[i+1]).split(":", 1)[0] for i in range(len(result)-1)
+               if result[i] in ("-B", "--bind")]
+    assert "/dev" not in sources
+    assert "/dev/null" in sources
+
+
 def test_rewrite_binds_dev_and_resolver(tmp_path):
     """A plain --writable dir loses tmpfs /dev + the host resolver; the rewriter
     must bind them back so /dev/null exists and in-sandbox pip/uv can resolve DNS."""
     sandbox = tmp_path / "sbx"
     sandbox.mkdir()
     sif = str(tmp_path / "img.sif")
-    SingularityWritableEnvironment._WRITABLE_REGISTRY[sif] = sandbox
+    SingularityWritableEnvironment._WRITABLE_REGISTRY["session"] = sandbox
     try:
         out = _rewrite_singularity_argv(_exec_argv(sif))
     finally:
-        SingularityWritableEnvironment._WRITABLE_REGISTRY.pop(sif, None)
+        SingularityWritableEnvironment._WRITABLE_REGISTRY.pop("session", None)
 
     # Each host path that exists is bound exactly once via --bind <path>.
-    for hostpath in ("/dev", "/etc/resolv.conf", "/etc/hosts"):
+    for hostpath in ("/dev/null", "/etc/resolv.conf", "/etc/hosts"):
         if not Path(hostpath).exists():
             continue
         bound = [
@@ -459,7 +480,7 @@ def test_oom_victim_unknown_root():
 
 async def _fake_build(*argv, **kwargs):
     """Emulate `singularity build --sandbox <dst> <sif>`: create dst, return rc=0."""
-    dst = argv[argv.index("--sandbox") + 1]
+    dst = argv[argv.index("--sandbox") + 1] if argv[0] == "singularity" else argv[-1]
     (Path(dst)).mkdir(parents=True, exist_ok=True)
     async def _comm():
         return (b"", b"")
@@ -487,6 +508,7 @@ def test_build_writable_sandbox_is_shared_per_sif(monkeypatch, tmp_path):
     )
 
     env = object.__new__(SingularityWritableEnvironment)
+    env.logger = logging.getLogger("test")
     env.session_id = "trial_A"
     env._image_cache_dir = tmp_path
 
@@ -532,9 +554,9 @@ def test_build_writable_sandbox_is_per_trial_isolated(monkeypatch, tmp_path):
 
     async def go():
         ea = object.__new__(SingularityWritableEnvironment)
-        ea.logger = None; ea.session_id = "trial_A"; ea._mounts = []; ea._sandbox_path = None
+        ea.logger = logging.getLogger("test"); ea.session_id = "trial_A"; ea._mounts = []; ea._sandbox_path = None
         eb = object.__new__(SingularityWritableEnvironment)
-        eb.logger = None; eb.session_id = "trial_B"; eb._mounts = []; eb._sandbox_path = None
+        eb.logger = logging.getLogger("test"); eb.session_id = "trial_B"; eb._mounts = []; eb._sandbox_path = None
         sif = tmp_path / "df_shared.sif"; sif.write_bytes(b"sif")
         a = await ea._build_writable_sandbox(sif)
         b = await eb._build_writable_sandbox(sif)
