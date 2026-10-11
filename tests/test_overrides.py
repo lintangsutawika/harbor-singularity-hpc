@@ -587,3 +587,22 @@ def test_new_mount_parents_are_traversable_under_private_umask(tmp_path):
         assert (private / "logs" / "agent").stat().st_mode & 0o777 == 0o755
     finally:
         os.umask(old_umask)
+
+
+def test_private_image_workdir_does_not_require_host_user_access(tmp_path, monkeypatch):
+    import harbor_singularity_hpc.environment as module
+    sandbox = tmp_path / "sandbox"
+    sandbox.mkdir()
+    real_ensure = module._ensure_mount_directory
+    def ensure(path):
+        if path == sandbox / "testbed":
+            raise PermissionError("Owned by the mapped task user")
+        real_ensure(path)
+    monkeypatch.setattr(module, "_ensure_mount_directory", ensure)
+    module.SingularityWritableEnvironment._WRITABLE_REGISTRY["session"] = sandbox
+    try:
+        result = module._rewrite_singularity_argv(_exec_argv(str(tmp_path / "test.sif")))
+        assert "--writable" in result
+        assert (sandbox / "staging").is_dir()
+    finally:
+        module.SingularityWritableEnvironment._WRITABLE_REGISTRY.pop("session", None)

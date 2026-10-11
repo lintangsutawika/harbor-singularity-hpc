@@ -165,6 +165,7 @@ def _rewrite_singularity_argv(argv: list) -> list:
 
     # Pre-create the bind destinations and workdir inside the sandbox.
     dests: list[tuple[str, bool]] = []
+    workdir = None
     for i, token in enumerate(argv):
         if token == "-B" and i + 1 < len(argv):
             spec = str(argv[i + 1])
@@ -172,7 +173,8 @@ def _rewrite_singularity_argv(argv: list) -> list:
             source = Path(spec.split(":", 1)[0])
             dests.append((dst.split(":", 1)[0], source.is_file() or source.is_char_device()))
         elif token == "--pwd" and i + 1 < len(argv):
-            dests.append((str(argv[i + 1]), False))
+            workdir = str(argv[i + 1])
+            dests.append((workdir, False))
     for dst, is_file in dests:
         if dst.startswith("/"):
             target = Path(sandbox) / dst.lstrip("/")
@@ -181,7 +183,14 @@ def _rewrite_singularity_argv(argv: list) -> list:
                 if not target.exists():
                     target.touch()
             else:
-                _ensure_mount_directory(target)
+                try:
+                    _ensure_mount_directory(target)
+                except PermissionError:
+                    # A task-user-owned private workdir is inaccessible to the
+                    # outer host UID. The runtime checks it inside the fakeroot
+                    # mapping; do not weaken the image's ownership/permissions.
+                    if dst != workdir:
+                        raise
 
     new = list(argv)
     new[new.index("--writable-tmpfs")] = "--writable"
