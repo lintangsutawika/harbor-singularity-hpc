@@ -136,5 +136,8 @@ isolated FastAPI/Uvicorn environment before starting their disconnected runtime.
 The current builder supports Debian/Ubuntu images with `python3-venv`.
 This integration is a draft pending native GPU and offline grading checks.
 
-Unit checks: 41 tests passed against Harbor 0.24.0. Native integration checks
-on ABCI are in progress; compatibility pins remain unchanged pending those checks.
+The implementation lives in `src/harbor_singularity_hpc/environment.py`; the
+root module is a compatibility entry point. Mount repair, scratch staging and
+offline image preparation remain independent helpers. The peer dependency
+range describes the supported Harbor releases; additional versions require
+compatibility and native execution checks.
