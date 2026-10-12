@@ -23,7 +23,7 @@ classifiers = [
 # only after re-running tests/ against the new harbor, since the overrides
 # reach into harbor's Singularity backend.
 dependencies = [
-    "harbor>=0.22,<0.23",
+    "harbor>=0.22,<0.25",
     "httpx",
 ]
 
