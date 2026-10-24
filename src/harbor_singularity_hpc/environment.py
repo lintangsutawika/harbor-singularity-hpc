@@ -149,6 +149,13 @@ def _rewrite_singularity_argv(argv: list) -> list:
         return argv
 
     # Pre-create the bind destinations and workdir inside the sandbox.
+    # Execution is `... exec <sandbox> bash -c 'exec /staging/bootstrap.sh "$@"' ...`.
+    # Harbor copies ITS bootstrap to /staging; run OUR bootstrap (staged at /harbor-hpc in
+    # _stage_our_bootstrap) instead. Only rewrites registered writable-sandbox launches.
+    for i, tok in enumerate(argv):
+        if tok == "/staging/bootstrap.sh":
+            argv[i] = "/harbor-hpc/bootstrap.sh"
+            break
     dests: list[str] = []
     for i, token in enumerate(argv):
         if token == "-B" and i + 1 < len(argv):
@@ -843,6 +850,7 @@ class SingularityWritableEnvironment(SingularityEnvironment):
                 "target": f"/opt/.hb_session_{self._trial_marker()}",
             })
 
+        await self._stage_our_bootstrap()
         await super()._start_server()
 
         # Raise the exec HTTP timeout floor once the (readiness-checked) client
@@ -903,6 +911,21 @@ class SingularityWritableEnvironment(SingularityEnvironment):
             except Exception as exc:
                 self.logger.debug(f"Memory watchdog error (continuing): {exc}")
                 await asyncio.sleep(3)
+
+    async def _stage_our_bootstrap(self) -> None:
+        """Copy OUR bootstrap.sh into the writable sandbox at /harbor-hpc/ so the
+        launch execs our version (offline uvicorn fallback) instead of harbor's.
+        Best-effort; falls back to stock bootstrap if staging fails."""
+        if not self._sandbox_path:
+            return
+        try:
+            src = Path(__file__).resolve().parent / "bootstrap.sh"
+            dst = self._sandbox_path / "harbor-hpc" / "bootstrap.sh"
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dst)
+            dst.chmod(0o755)
+        except Exception as exc:  # best-effort
+            self.logger.warning("failed to stage our bootstrap into sandbox: %s", exc)
 
     async def stop(self, delete: bool) -> None:
         # Harbor's stock stop() terminates the outer Singularity process before
