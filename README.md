@@ -119,3 +119,25 @@ regardless of FUSE config.
 ## License
 
 Apache-2.0, matching harbor.
+
+## Contained mounts and offline builds
+
+File and character-device mounts receive file mountpoints in writable rootfs
+sandboxes. The helper restores basic devices individually and does not mount
+the host `/dev` tree, so caller-reserved GPU devices remain isolated.
+
+Derived image builds stage their inputs on local scratch before using fakeroot,
+then publish finished SIFs using the host UID. This avoids root-squashed shared
+filesystems without making project directories public. Set `SINGULARITY_TMPDIR`
+to allocated node-local space large enough for the base and derived images.
+
+With Harbor's proposed offline Unix-socket transport, no-network images bake an
+isolated FastAPI/Uvicorn environment before starting their disconnected runtime.
+The current builder supports Debian/Ubuntu images with `python3-venv`.
+This integration is a draft pending native GPU and offline grading checks.
+
+The implementation lives in `src/harbor_singularity_hpc/environment.py`; the
+root module is a compatibility entry point. Mount repair, scratch staging and
+offline image preparation remain independent helpers. The peer dependency
+range describes the supported Harbor releases; additional versions require
+compatibility and native execution checks.

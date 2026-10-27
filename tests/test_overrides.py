@@ -13,6 +13,7 @@ Two kinds:
 
 import asyncio
 import inspect
+import logging
 from types import SimpleNamespace
 
 from pathlib import Path
@@ -126,6 +127,7 @@ def _exec_argv(sif: str) -> list:
         "--fakeroot", "--containall", "--pid",
         "-B", "/tmp/staging:/staging",
         "-B", "/tmp/staging/env_files:/staging/env_files",
+        "-B", "/tmp/marker:/opt/.hb_session_session",
         sif,
         "bash", "-c", 'exec /staging/bootstrap.sh "$@"',
     ]
@@ -135,11 +137,11 @@ def test_rewrite_swaps_flag_and_image_and_creates_dests(tmp_path):
     sandbox = tmp_path / "sbx"
     sandbox.mkdir()
     sif = str(tmp_path / "img.sif")
-    SingularityWritableEnvironment._WRITABLE_REGISTRY[sif] = sandbox
+    SingularityWritableEnvironment._WRITABLE_REGISTRY["session"] = sandbox
     try:
         out = _rewrite_singularity_argv(_exec_argv(sif))
     finally:
-        SingularityWritableEnvironment._WRITABLE_REGISTRY.pop(sif, None)
+        SingularityWritableEnvironment._WRITABLE_REGISTRY.pop("session", None)
 
     assert "--writable" in out and "--writable-tmpfs" not in out
     assert str(sandbox) in out and sif not in out
@@ -148,20 +150,56 @@ def test_rewrite_swaps_flag_and_image_and_creates_dests(tmp_path):
         assert (sandbox / dst).is_dir(), f"{dst} not pre-created"
 
 
+def test_rewrite_runs_our_staged_bootstrap(tmp_path):
+    """The launch command must exec our staged bootstrap, not harbor's copy."""
+    sandbox = tmp_path / "sbx"
+    sandbox.mkdir()
+    sif = str(tmp_path / "img.sif")
+    SingularityWritableEnvironment._WRITABLE_REGISTRY["session"] = sandbox
+    try:
+        out = _rewrite_singularity_argv(_exec_argv(sif))
+    finally:
+        SingularityWritableEnvironment._WRITABLE_REGISTRY.pop("session", None)
+
+    command = next(str(tok) for tok in out if "bootstrap.sh" in str(tok))
+    assert "/harbor-hpc/bootstrap.sh" in command
+    assert "/staging/bootstrap.sh" not in command
+    assert '"$@"' in command
+
+
+def test_file_binds_keep_file_mountpoints_and_do_not_expose_all_host_devices(tmp_path):
+    sandbox = tmp_path / "sandbox"
+    sandbox.mkdir()
+    driver = tmp_path / "libcuda.so.1"
+    driver.write_bytes(b"driver")
+    argv = _exec_argv(str(tmp_path / "image.sif"))
+    argv[2:2] = ["-B", f"{driver}:/.singularity.d/libs/libcuda.so.1:ro"]
+    SingularityWritableEnvironment._WRITABLE_REGISTRY["session"] = sandbox
+    try:
+        result = _rewrite_singularity_argv(argv)
+    finally:
+        SingularityWritableEnvironment._WRITABLE_REGISTRY.pop("session", None)
+    assert (sandbox / ".singularity.d/libs/libcuda.so.1").is_file()
+    sources = [str(result[i+1]).split(":", 1)[0] for i in range(len(result)-1)
+               if result[i] in ("-B", "--bind")]
+    assert "/dev" not in sources
+    assert "/dev/null" in sources
+
+
 def test_rewrite_binds_dev_and_resolver(tmp_path):
     """A plain --writable dir loses tmpfs /dev + the host resolver; the rewriter
     must bind them back so /dev/null exists and in-sandbox pip/uv can resolve DNS."""
     sandbox = tmp_path / "sbx"
     sandbox.mkdir()
     sif = str(tmp_path / "img.sif")
-    SingularityWritableEnvironment._WRITABLE_REGISTRY[sif] = sandbox
+    SingularityWritableEnvironment._WRITABLE_REGISTRY["session"] = sandbox
     try:
         out = _rewrite_singularity_argv(_exec_argv(sif))
     finally:
-        SingularityWritableEnvironment._WRITABLE_REGISTRY.pop(sif, None)
+        SingularityWritableEnvironment._WRITABLE_REGISTRY.pop("session", None)
 
     # Each host path that exists is bound exactly once via --bind <path>.
-    for hostpath in ("/dev", "/etc/resolv.conf", "/etc/hosts"):
+    for hostpath in ("/dev/null", "/etc/resolv.conf", "/etc/hosts"):
         if not Path(hostpath).exists():
             continue
         bound = [
@@ -459,7 +497,7 @@ def test_oom_victim_unknown_root():
 
 async def _fake_build(*argv, **kwargs):
     """Emulate `singularity build --sandbox <dst> <sif>`: create dst, return rc=0."""
-    dst = argv[argv.index("--sandbox") + 1]
+    dst = argv[argv.index("--sandbox") + 1] if "--sandbox" in argv else str(Path(argv[argv.index("--bind") + 1].split(":", 1)[0]) / Path(argv[-1]).name)
     (Path(dst)).mkdir(parents=True, exist_ok=True)
     async def _comm():
         return (b"", b"")
@@ -487,6 +525,7 @@ def test_build_writable_sandbox_is_shared_per_sif(monkeypatch, tmp_path):
     )
 
     env = object.__new__(SingularityWritableEnvironment)
+    env.logger = logging.getLogger("test")
     env.session_id = "trial_A"
     env._image_cache_dir = tmp_path
 
@@ -495,7 +534,9 @@ def test_build_writable_sandbox_is_shared_per_sif(monkeypatch, tmp_path):
         p.write_bytes(b"sif")
         a = await env._build_writable_sandbox(p)
         b = await env._build_writable_sandbox(p)  # same sif again
-        c = await env._build_writable_sandbox(tmp_path / "other.sif")  # distinct
+        other = tmp_path / "other.sif"
+        other.write_bytes(b"other sif")
+        c = await env._build_writable_sandbox(other)  # distinct
         return a, b, c
 
     a, b, c = asyncio.run(go())
@@ -516,11 +557,14 @@ def test_build_writable_sandbox_is_per_trial_isolated(monkeypatch, tmp_path):
     from harbor_singularity_hpc.environment import SingularityWritableEnvironment
 
     async def _fake_build(*argv, **kwargs):
-        if argv[0] == "singularity":
+        if "--sandbox" in argv:
+            assert "--fakeroot" in argv
             dst = argv[argv.index("--sandbox") + 1]
             (Path(dst)).mkdir(parents=True, exist_ok=True)
-        elif argv[0] == "cp":
-            (Path(argv[-1])).mkdir(parents=True, exist_ok=True)
+        elif "cp" in argv:
+            assert "--fakeroot" in argv and "-a" in argv
+            root = Path(argv[argv.index("--bind") + 1].split(":", 1)[0])
+            (root / Path(argv[-1]).name).mkdir(parents=True, exist_ok=True)
         async def _comm():
             return (b"", b"")
         return SimpleNamespace(returncode=0, communicate=_comm)
@@ -532,9 +576,9 @@ def test_build_writable_sandbox_is_per_trial_isolated(monkeypatch, tmp_path):
 
     async def go():
         ea = object.__new__(SingularityWritableEnvironment)
-        ea.logger = None; ea.session_id = "trial_A"; ea._mounts = []; ea._sandbox_path = None
+        ea.logger = logging.getLogger("test"); ea.session_id = "trial_A"; ea._mounts = []; ea._sandbox_path = None
         eb = object.__new__(SingularityWritableEnvironment)
-        eb.logger = None; eb.session_id = "trial_B"; eb._mounts = []; eb._sandbox_path = None
+        eb.logger = logging.getLogger("test"); eb.session_id = "trial_B"; eb._mounts = []; eb._sandbox_path = None
         sif = tmp_path / "df_shared.sif"; sif.write_bytes(b"sif")
         a = await ea._build_writable_sandbox(sif)
         b = await eb._build_writable_sandbox(sif)
@@ -545,3 +589,50 @@ def test_build_writable_sandbox_is_per_trial_isolated(monkeypatch, tmp_path):
     assert a.name.startswith("hbsbx_") and b.name.startswith("hbsbx_")
     assert "trial_A" in a.name and "trial_B" in b.name
     monkeypatch.setattr(asyncio, "create_subprocess_exec", real_exec)
+
+
+def test_new_mount_parents_are_traversable_under_private_umask(tmp_path):
+    from harbor_singularity_hpc.environment import _ensure_mount_directory
+    import os
+    old_umask = os.umask(0o077)
+    try:
+        private = tmp_path / "private"
+        private.mkdir(mode=0o700)
+        _ensure_mount_directory(private / "logs" / "agent")
+        assert private.stat().st_mode & 0o777 == 0o700
+        assert (private / "logs").stat().st_mode & 0o777 == 0o755
+        assert (private / "logs" / "agent").stat().st_mode & 0o777 == 0o755
+    finally:
+        os.umask(old_umask)
+
+
+def test_private_image_workdir_does_not_require_host_user_access(tmp_path, monkeypatch):
+    import harbor_singularity_hpc.environment as module
+    sandbox = tmp_path / "sandbox"
+    sandbox.mkdir()
+    real_ensure = module._ensure_mount_directory
+    def ensure(path):
+        if path == sandbox / "testbed":
+            raise PermissionError("Owned by the mapped task user")
+        real_ensure(path)
+    monkeypatch.setattr(module, "_ensure_mount_directory", ensure)
+    module.SingularityWritableEnvironment._WRITABLE_REGISTRY["session"] = sandbox
+    try:
+        result = module._rewrite_singularity_argv(_exec_argv(str(tmp_path / "test.sif")))
+        assert "--writable" in result
+        assert (sandbox / "staging").is_dir()
+    finally:
+        module.SingularityWritableEnvironment._WRITABLE_REGISTRY.pop("session", None)
+
+
+def test_copy_cache_changes_when_source_permissions_change(tmp_path):
+    from harbor_singularity_hpc.environment import _path_digest
+    root = tmp_path / "source"
+    root.mkdir(mode=0o700)
+    (root / "module.py").write_text("unchanged code")
+    before = _path_digest(root)
+    root.chmod(0o755)
+    assert _path_digest(root) != before
+    before = _path_digest(root)
+    (root / "empty-directory").mkdir()
+    assert _path_digest(root) != before

@@ -110,6 +110,21 @@ def _install_argv_rewrite() -> None:
     asyncio.create_subprocess_exec = _wrapped  # type: ignore[assignment]
 
 
+def _ensure_mount_directory(path: Path) -> None:
+    """Create only missing mount parents with traversable permissions.
+
+    Harness umask may be 077. Existing image permissions must remain intact.
+    """
+    missing = []
+    current = path
+    while not current.exists():
+        missing.append(current)
+        current = current.parent
+    for directory in reversed(missing):
+        directory.mkdir(exist_ok=True)
+        directory.chmod(0o755)
+
+
 def _rewrite_singularity_argv(argv: list) -> list:
     """Rewrite a ``singularity exec --writable-tmpfs <registered-sif>`` argv to
     use ``--writable <sandbox>``, pre-creating every ``-B`` destination and the
@@ -153,20 +168,39 @@ def _rewrite_singularity_argv(argv: list) -> list:
     # Harbor copies ITS bootstrap to /staging; run OUR bootstrap (staged at /harbor-hpc in
     # _stage_our_bootstrap) instead. Only rewrites registered writable-sandbox launches.
     for i, tok in enumerate(argv):
-        if tok == "/staging/bootstrap.sh":
-            argv[i] = "/harbor-hpc/bootstrap.sh"
+        # The path appears inside a shell command string (``bash -c 'exec
+        # /staging/bootstrap.sh "$@"'``), not as a standalone argv element, so
+        # replace it as a substring rather than comparing whole tokens.
+        if "/staging/bootstrap.sh" in str(tok):
+            argv[i] = str(tok).replace("/staging/bootstrap.sh", "/harbor-hpc/bootstrap.sh")
             break
-    dests: list[str] = []
+    dests: list[tuple[str, bool]] = []
+    workdir = None
     for i, token in enumerate(argv):
         if token == "-B" and i + 1 < len(argv):
             spec = str(argv[i + 1])
             dst = spec.split(":", 1)[1] if ":" in spec else spec
-            dests.append(dst.split(":", 1)[0])  # drop any :ro/:rw option
+            source = Path(spec.split(":", 1)[0])
+            dests.append((dst.split(":", 1)[0], source.is_file() or source.is_char_device()))
         elif token == "--pwd" and i + 1 < len(argv):
-            dests.append(str(argv[i + 1]))
-    for dst in dests:
+            workdir = str(argv[i + 1])
+            dests.append((workdir, False))
+    for dst, is_file in dests:
         if dst.startswith("/"):
-            (Path(sandbox) / dst.lstrip("/")).mkdir(parents=True, exist_ok=True)
+            target = Path(sandbox) / dst.lstrip("/")
+            if is_file:
+                _ensure_mount_directory(target.parent)
+                if not target.exists():
+                    target.touch()
+            else:
+                try:
+                    _ensure_mount_directory(target)
+                except PermissionError:
+                    # A task-user-owned private workdir is inaccessible to the
+                    # outer host UID. The runtime checks it inside the fakeroot
+                    # mapping; do not weaken the image's ownership/permissions.
+                    if dst != workdir:
+                        raise
 
     new = list(argv)
     new[new.index("--writable-tmpfs")] = "--writable"
@@ -180,13 +214,22 @@ def _rewrite_singularity_argv(argv: list) -> list:
     # cannot reach PyPI. The network namespace is shared (no ``--net``), so binding
     # the host copies back in restores both. Idempotent: skip a path already bound
     # (harbor's argv, or a repeat call) or absent on the host.
-    for hostpath in ("/dev", "/etc/resolv.conf", "/etc/hosts"):
+    # Binding all of host /dev exposes unreserved GPUs and host devices. Restore
+    # only the basic character devices required by the contained process. GPU
+    # backends must bind each reserved numbered device explicitly.
+    hostpaths = ("/dev/null", "/dev/zero", "/dev/full", "/dev/random",
+                 "/dev/urandom", "/dev/tty", "/etc/resolv.conf", "/etc/hosts")
+    for hostpath in hostpaths:
         already = any(
             str(new[i]) in ("-B", "--bind") and i + 1 < len(new)
             and str(new[i + 1]).split(":", 1)[0] == hostpath
             for i in range(len(new))
         )
         if not already and os.path.exists(hostpath):
+            target = Path(sandbox) / hostpath.lstrip("/")
+            _ensure_mount_directory(target.parent)
+            if not target.exists():
+                target.touch()
             new[2:2] = ["--bind", hostpath]
     return new
 
@@ -387,12 +430,16 @@ def _dockerfile_layers(dockerfile: Path, build_context: Path | None = None) -> l
 
 
 def _path_digest(path: Path) -> str:
-    """Content digest of a COPY source (file, or every file under a dir)."""
+    """Digest COPY contents, directory topology and Unix permission bits."""
     h = hashlib.sha256()
-    paths = sorted(p for p in path.rglob("*") if p.is_file()) if path.is_dir() else [path]
+    paths = [path, *sorted(path.rglob("*"))] if path.is_dir() else [path]
     for p in paths:
         h.update(str(p.relative_to(path) if path.is_dir() else p.name).encode())
-        h.update(p.read_bytes())
+        h.update(b"\0" + str(p.stat().st_mode & 0o7777).encode() + b"\0")
+        if p.is_file():
+            with p.open("rb") as stream:
+                for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                    h.update(chunk)
     return h.hexdigest()
 
 
@@ -633,7 +680,7 @@ class SingularityWritableEnvironment(SingularityEnvironment):
         """
         root = self._sandbox_root()
         root.mkdir(parents=True, exist_ok=True)
-        sif_key = hashlib.sha256(str(sif_path).encode("utf-8")).hexdigest()[:16]
+        sif_key = hashlib.sha256(("preserve-owners-v2:" + str(sif_path)).encode("utf-8")).hexdigest()[:16]
         base = root / f"hbsbx_base_{sif_key}"
         # The rewriter must map an exec argv back to this trial's sandbox. It reads
         # a session marker the environment injects as a bind target
@@ -652,39 +699,58 @@ class SingularityWritableEnvironment(SingularityEnvironment):
                 self.logger.info(
                     f"Building base writable sandbox {base} from {sif_path}"
                 )
-                cmd = ["singularity", "build", "--fix-perms", "--sandbox", str(base), str(sif_path)]
-                process = await asyncio.create_subprocess_exec(
-                    *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
-                )
-                _, stderr = await process.communicate()
-                if process.returncode != 0:
-                    raise RuntimeError(
-                        f"Failed to build base sandbox from {sif_path}: "
-                        f"{stderr.decode(errors='replace')}"
+                # Entering fakeroot cannot read private NFS paths under root
+                # squashing. Stage the input as the owning host user first.
+                local_sif = root / f"hbsbx_extract_{sif_key}.sif"
+                try:
+                    await asyncio.to_thread(shutil.copyfile, sif_path, local_sif)
+                    cmd = ["singularity", "build", "--fakeroot", "--sandbox", str(base), str(local_sif)]
+                    process = await asyncio.create_subprocess_exec(
+                        *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
                     )
+                    _, stderr = await process.communicate()
+                    if process.returncode != 0:
+                        raise RuntimeError(
+                            f"Failed to build base sandbox from {sif_path}: "
+                            f"{stderr.decode(errors='replace')}"
+                        )
+                finally:
+                    local_sif.unlink(missing_ok=True)
         finally:
             await asyncio.to_thread(fcntl.flock, lock_fd, fcntl.LOCK_UN)
             os.close(lock_fd)
 
-        # CoW-clone the base into this trial's private sandbox.
+        # Extracting or cloning as the host user loses image UIDs and makes
+        # private learner-owned workspaces unreadable after su. Both operations
+        # must run in the same fakeroot UID mapping used by the task runtime.
         if not trial.exists():
-            self.logger.debug(f"Reflink-cloning {base} -> {trial}")
+            self.logger.debug(f"Reflink-cloning {base} -> {trial} with image ownership")
+            _ensure_mount_directory(base / "mnt/harbor-sandboxes")
+            prefix = [
+                "singularity", "exec", "--fakeroot", "--containall",
+                "--no-mount", "home,tmp,bind-paths", "--pwd", "/",
+                "--bind", f"{root}:/mnt/harbor-sandboxes", str(base),
+            ]
+            source = f"/mnt/harbor-sandboxes/{base.name}"
+            target = f"/mnt/harbor-sandboxes/{trial.name}"
             clone = await asyncio.create_subprocess_exec(
-                "cp", "--reflink=auto", "-a", str(base), str(trial),
+                *prefix, "cp", "--reflink=auto", "-a", source, target,
                 stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
             )
-            _, cerr = await clone.communicate()
+            _, stderr = await clone.communicate()
             if clone.returncode != 0:
-                # Fallback: plain recursive copy (slower, still isolated).
-                self.logger.warning(f"reflink failed ({cerr.decode(errors='replace')}); plain copy")
-                clone2 = await asyncio.create_subprocess_exec(
-                    "cp", "-a", str(base), str(trial),
+                # BusyBox cp lacks --reflink. Keep the same UID mapping for the
+                # fallback; a host-user cp would silently lose image ownership.
+                fallback = await asyncio.create_subprocess_exec(
+                    *prefix, "sh", "-c",
+                    f"rm -rf -- {shlex.quote(target)} && cp -a {shlex.quote(source)} {shlex.quote(target)}",
                     stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
                 )
-                _, cerr2 = await clone2.communicate()
-                if clone2.returncode != 0:
+                _, stderr = await fallback.communicate()
+                if fallback.returncode != 0:
                     raise RuntimeError(
-                        f"Failed to clone sandbox {base} -> {trial}: {cerr2.decode(errors='replace')}"
+                        f"Failed to clone sandbox preserving image ownership {base} -> {trial}: "
+                        f"{stderr.decode(errors='replace')}"
                     )
         return trial
 
@@ -696,15 +762,28 @@ class SingularityWritableEnvironment(SingularityEnvironment):
         and reclaimed at job end, so leftovers are not fatal."""
         if not sandbox or not sandbox.exists():
             return
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                "chmod", "-R", "u+rwX", str(sandbox),
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL,
-            )
-            await proc.wait()
-        except Exception:
-            pass
+        # Private task-user files carry subordinate host UIDs. Remove them in
+        # that same mapping; host-user chmod/rmtree cannot traverse these files.
+        if sandbox.parent != self._sandbox_root() or not sandbox.name.startswith("hbsbx_"):
+            self.logger.warning("Refusing to remove a sandbox outside the owned cache")
+            return
+        key = sandbox.name.split("_", 2)[1]
+        base = sandbox.parent / f"hbsbx_base_{key}"
+        if base.exists():
+            try:
+                target = f"/mnt/harbor-sandboxes/{sandbox.name}"
+                proc = await asyncio.create_subprocess_exec(
+                    "singularity", "exec", "--fakeroot", "--containall",
+                    "--no-mount", "home,tmp,bind-paths", "--pwd", "/",
+                    "--bind", f"{sandbox.parent}:/mnt/harbor-sandboxes", str(base),
+                    "sh", "-c", f"chmod -R u+rwX {shlex.quote(target)} && rm -rf -- {shlex.quote(target)}",
+                    stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+                )
+                await proc.wait()
+                if proc.returncode == 0:
+                    return
+            except Exception:
+                self.logger.warning("Mapped sandbox cleanup failed; job-end cleanup remains available")
         shutil.rmtree(sandbox, ignore_errors=True)
 
     # -- pull retry + semaphore -------------------------------------------
@@ -776,17 +855,37 @@ class SingularityWritableEnvironment(SingularityEnvironment):
     async def _build_derived_layer(self, base: Path, fragment: str, out: Path, label: str) -> None:
         def_path = out.with_suffix(".def")
         def_path.write_text(f"Bootstrap: localimage\nFrom: {base}\n\n{fragment}")
-        tmp_out = out.with_name(f"{out.name}.tmp-{os.getpid()}")
-        # Give %post a private /tmp: singularity otherwise binds the host's shared
-        # /tmp, where concurrent builds' staged scripts would collide.
-        # World-writable + sticky like a real /tmp: apt drops to its ``_apt`` user and
-        # fails every fetch ("Couldn't create temporary file") under mkdtemp's 0700.
-        build_tmp = Path(tempfile.mkdtemp(prefix="df_tmp_", dir=self._image_cache_dir))
+        # NFS root-squashing can deny fakeroot access to group/home paths.
+        # Stage build inputs and output locally, then publish with the host UID.
+        scratch_parent = os.environ.get("SINGULARITY_TMPDIR")
+        build_root = Path(tempfile.mkdtemp(prefix="harbor_layer_", dir=scratch_parent))
+        local_base = build_root / "base.sif"
+        shutil.copyfile(base, local_base)
+        rewritten = []
+        files_section = False
+        for line in fragment.splitlines():
+            if line.startswith("%"):
+                files_section = line.strip() == "%files"
+            elif files_section and line.strip():
+                source, destination = line.strip().rsplit(None, 1)
+                staged = build_root / f"input-{len(rewritten)}"
+                original = Path(source)
+                if original.is_dir():
+                    shutil.copytree(original, staged)
+                else:
+                    shutil.copy2(original, staged)
+                line = f"    {staged} {destination}"
+            rewritten.append(line)
+        local_def = build_root / "recipe.def"
+        local_def.write_text(f"Bootstrap: localimage\nFrom: {local_base}\n\n" + "\n".join(rewritten) + "\n")
+        tmp_out = build_root / "result.sif"
+        build_tmp = build_root / "tmp"
+        build_tmp.mkdir(mode=0o1777)
         build_tmp.chmod(0o1777)
         cmd = [
             "singularity", "build", "--fakeroot", "--force",
             "--bind", f"{build_tmp}:/tmp",
-            str(tmp_out), str(def_path),
+            str(tmp_out), str(local_def),
         ]
         self.logger.info(f"Building Dockerfile layer {label}: {' '.join(cmd)}")
         try:
@@ -805,18 +904,48 @@ class SingularityWritableEnvironment(SingularityEnvironment):
                     f"recipe {def_path}, log {log_path}. Output tail:\n"
                     f"{output.decode(errors='replace')[-4000:]}"
                 )
-            os.replace(tmp_out, out)
+            publication = out.with_name(f"{out.name}.tmp-{os.getpid()}")
+            try:
+                shutil.copyfile(tmp_out, publication)
+                os.replace(publication, out)
+            finally:
+                publication.unlink(missing_ok=True)
         finally:
-            tmp_out.unlink(missing_ok=True)
-            shutil.rmtree(build_tmp, ignore_errors=True)
+            shutil.rmtree(build_root, ignore_errors=True)
 
     # -- server launch (writable sandbox + exec timeout floor) ------------
+
+    async def _ensure_offline_server_sif(self, base: Path) -> Path:
+        if self._network_disabled:
+            # Provision the harness before entering the offline namespace.
+            # Keep dependencies isolated from the task's Python environment.
+            fragment = (
+                "%post\n"
+                "    set -eu\n"
+                "    apt-get update -qq\n"
+                "    apt-get install -y --no-install-recommends python3-venv\n"
+                "    /usr/bin/python3 -m venv /opt/harbor-server\n"
+                "    /opt/harbor-server/bin/python -m pip install 'fastapi==0.128.0' 'uvicorn==0.48.0'\n"
+            )
+            key = hashlib.sha256((str(base) + fragment).encode()).hexdigest()[:16]
+            derived = self._image_cache_dir / f"offline_server_{key}.sif"
+            lock = os.open(str(derived.with_suffix(".lock")), os.O_CREAT | os.O_RDWR)
+            try:
+                await asyncio.to_thread(fcntl.flock, lock, fcntl.LOCK_EX)
+                if not derived.exists():
+                    await self._build_derived_layer(base, fragment, derived, "offline server")
+            finally:
+                os.close(lock)
+            return derived
+        return base
 
     async def _start_server(self) -> None:
         # If the task Dockerfile adds dependency layers, bake them into a derived
         # sif and sandbox THAT, so singularity honors RUN/COPY/ENV like Modal/Docker.
         if self._sif_path is not None and self._dockerfile_path.exists():
             self._sif_path = await self._ensure_dockerfile_derived_sif(self._sif_path)
+        if self._sif_path is not None:
+            self._sif_path = await self._ensure_offline_server_sif(self._sif_path)
         # Build the writable sandbox (per-trial, isolated) and register it keyed by
         # session_id (not the sif path — which is shared across concurrent trials of
         # a repo and would collide). Every exec for THIS trial carries a marker bind
