@@ -150,6 +150,23 @@ def test_rewrite_swaps_flag_and_image_and_creates_dests(tmp_path):
         assert (sandbox / dst).is_dir(), f"{dst} not pre-created"
 
 
+def test_rewrite_runs_our_staged_bootstrap(tmp_path):
+    """The launch command must exec our staged bootstrap, not harbor's copy."""
+    sandbox = tmp_path / "sbx"
+    sandbox.mkdir()
+    sif = str(tmp_path / "img.sif")
+    SingularityWritableEnvironment._WRITABLE_REGISTRY["session"] = sandbox
+    try:
+        out = _rewrite_singularity_argv(_exec_argv(sif))
+    finally:
+        SingularityWritableEnvironment._WRITABLE_REGISTRY.pop("session", None)
+
+    command = next(str(tok) for tok in out if "bootstrap.sh" in str(tok))
+    assert "/harbor-hpc/bootstrap.sh" in command
+    assert "/staging/bootstrap.sh" not in command
+    assert '"$@"' in command
+
+
 def test_file_binds_keep_file_mountpoints_and_do_not_expose_all_host_devices(tmp_path):
     sandbox = tmp_path / "sandbox"
     sandbox.mkdir()
